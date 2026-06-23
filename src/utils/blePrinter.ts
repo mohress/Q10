@@ -289,18 +289,12 @@ class BLEPrinterController {
     // Handle Cordova Native Bluetooth Plugins inside APK
     if (env === 'android_cordova') {
       this.updateState({ 
-        statusMessage: 'جاري استجواب صلاحيات الأندرويد (Bluetooth Access Permissions)...', 
+        statusMessage: 'جاري التحقق من قنوات البلوتوث...', 
         progress: 20 
       });
-      const permissionGranted = await this.requestAndroidPermissions();
-      if (!permissionGranted) {
-        this.updateState({
-          isConnected: false,
-          isConnecting: false,
-          error: 'تم رفض صلاحيات البلوتوث والموقع على جهاز الأندرويد. يرجى تفعيل الصلاحيات من إعدادات الهاتف لإتاحة البحث عن الطابعة.'
-        });
-        return false;
-      }
+      
+      // Request permissions but do not block, as they might be pre-granted or managed by the container.
+      await this.requestAndroidPermissions().catch((e) => console.log('Permission request ignored/failed', e));
 
       this.updateState({ 
         statusMessage: 'جاري تشغيل عملية مسح الرادار للبلوتوث بحثاً عن طابعتك...', 
