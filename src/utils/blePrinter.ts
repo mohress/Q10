@@ -34,7 +34,7 @@ export interface BLEPrinterState {
   isScanning: boolean;
 }
 
-// Top 5 most common service and characteristic UUIDs for Chinese portable thermal printers
+// Top most common service and characteristic UUIDs for Chinese portable thermal printers
 const COMMON_CHINESE_PRINTERS = [
   {
     // Standard UART / SPP-like service (MPT-II, PT-210, PT-280, PT-380, Goojprt, etc.)
@@ -65,6 +65,26 @@ const COMMON_CHINESE_PRINTERS = [
     // Nordic UART service (Used by custom BLE printers)
     service: '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
     characteristic: '6e400002-b5a3-f393-e0a9-e50e24dcca9e'
+  },
+  {
+    // Xprinter standard raw printer service
+    service: '000018f0-0000-1000-8000-00805f9b34fb',
+    characteristic: '00002af1-0000-1000-8000-00805f9b34fb'
+  },
+  {
+    // Custom printer ff00
+    service: '0000ff00-0000-1000-8000-00805f9b34fb',
+    characteristic: '0000ff01-0000-1000-8000-00805f9b34fb'
+  },
+  {
+    // Custom printer af30
+    service: '0000af30-0000-1000-8000-00805f9b34fb',
+    characteristic: '0000af31-0000-1000-8000-00805f9b34fb'
+  },
+  {
+    // Tencent / WeChat printer standard fee7
+    service: '0000fee7-0000-1000-8000-00805f9b34fb',
+    characteristic: '0000fec9-0000-1000-8000-00805f9b34fb'
   }
 ];
 
@@ -667,34 +687,38 @@ class BLEPrinterController {
 
     // 3. Fallback: Scan primary services and score write properties
     console.log('Direct probe did not match, scanning primary services as fallback...');
-    const services = await server.getPrimaryServices();
-    let bestScore = -1000;
-    let selectedChar: any = null;
+    try {
+      const services = await server.getPrimaryServices();
+      let bestScore = -1000;
+      let selectedChar: any = null;
 
-    for (const srv of services) {
-      try {
-        const score = this.getServiceScore(srv.uuid);
-        if (score < -100) continue; // Skip restricted/system services
+      for (const srv of services) {
+        try {
+          const score = this.getServiceScore(srv.uuid);
+          if (score < -100) continue; // Skip restricted/system services
 
-        const characteristics = await srv.getCharacteristics();
-        for (const char of characteristics) {
-          const props = char.properties;
-          const charScore = this.getCharacteristicScore(char.uuid, props);
-          const totalScore = score + charScore;
-          
-          if (totalScore > bestScore && charScore > 0) {
-            bestScore = totalScore;
-            selectedChar = char;
+          const characteristics = await srv.getCharacteristics();
+          for (const char of characteristics) {
+            const props = char.properties;
+            const charScore = this.getCharacteristicScore(char.uuid, props);
+            const totalScore = score + charScore;
+            
+            if (totalScore > bestScore && charScore > 0) {
+              bestScore = totalScore;
+              selectedChar = char;
+            }
           }
+        } catch (e) {
+          // Skip protected services
         }
-      } catch (e) {
-        // Skip protected services
       }
-    }
 
-    if (selectedChar) {
-      console.log(`Discovered best writing characteristics: ${selectedChar.uuid} with score: ${bestScore}`);
-      return selectedChar;
+      if (selectedChar) {
+        console.log(`Discovered best writing characteristics: ${selectedChar.uuid} with score: ${bestScore}`);
+        return selectedChar;
+      }
+    } catch (scanErr) {
+      console.warn('Scanning services via getPrimaryServices failed/blocked', scanErr);
     }
 
     // Last resort fallback
@@ -720,6 +744,9 @@ class BLEPrinterController {
     addRange(0xffe0, 0xffef); 
     addRange(0xfff0, 0xfff9); 
     addRange(0xfee0, 0xfeef); 
+    addRange(0x18f0, 0x18f5); // Xprinter
+    addRange(0xff00, 0xff0f); // Custom ff00
+    addRange(0xaf30, 0xaf35); // Custom af30
 
     const customSrv = this.getCustomServiceUuid();
     if (customSrv) services.add(customSrv.toLowerCase());
@@ -732,7 +759,7 @@ class BLEPrinterController {
     const customService = this.getCustomServiceUuid();
     if (customService && clean === customService.toLowerCase()) return 10000;
 
-    const printerServices = ['ffe0', 'fff0', 'ffd0', 'ff00', 'fee7', '6e40', '4953', 'e7fe'];
+    const printerServices = ['ffe0', 'fff0', 'ffd0', 'ff00', 'fee7', '6e40', '4953', 'e7fe', '18f0', 'af30'];
     for (const prefix of printerServices) {
       if (clean.includes(prefix)) return 100;
     }
@@ -752,7 +779,7 @@ class BLEPrinterController {
     const customChar = this.getCustomCharacteristicUuid();
     if (customChar && clean === customChar.toLowerCase()) return 10000;
 
-    const printerWriteChars = ['ffe1', 'fff1', 'ffd1', 'ae01', '6e400002'];
+    const printerWriteChars = ['ffe1', 'fff1', 'ffd1', 'ae01', '6e400002', '2af1', 'ff01', 'af31', 'fec9'];
     for (const target of printerWriteChars) {
       if (clean.includes(target)) {
         score += 200;
