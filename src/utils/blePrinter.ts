@@ -174,9 +174,72 @@ class BLEPrinterController {
    * Scan and connect to the portable BLE printer
    */
   public async connect(): Promise<boolean> {
+    // Check if running inside a native Android Webview Wrapper with an injected companion interface
+    const win = window as any;
+    const bridge = win.AndroidPrinter || win.Android || win.PrintInterface || win.PrinterBridge;
+    
+    if (bridge) {
+      this.updateState({ 
+        isConnecting: true, 
+        error: null, 
+        statusMessage: 'جاري الاقتران مع الطابعة عبر جسر الأندرويد الأصلي (Native Bridge)...' 
+      });
+      try {
+        if (typeof bridge.connect === 'function') {
+          bridge.connect();
+        }
+        
+        this.updateState({
+          isConnected: true,
+          isConnecting: false,
+          deviceName: 'طابعة الأندرويد المدمجة (APK Bridge)',
+          statusMessage: 'تم الاقتران بنجاح عبر نظام الأندرويد للتطبيق! ⚡',
+          progress: 100
+        });
+        
+        setTimeout(() => {
+          this.updateState({ statusMessage: null, progress: 0 });
+        }, 2500);
+        return true;
+      } catch (err: any) {
+        this.updateState({
+          isConnected: false,
+          isConnecting: false,
+          error: `فشلت محاولة الاقتران كخطأ في جسر النظام: ${err.message || err}`
+        });
+        return false;
+      }
+    }
+
     const nav = navigator as any;
     if (!nav.bluetooth) {
-      this.updateState({ error: 'مستعرض الويب الحالي لا يدعم الاتصال بتقنية بلوتوث Web Bluetooth. يرجى استخدام Google Chrome أو متصفح يدعم BLE.' });
+      const ua = navigator.userAgent || '';
+      const isIOS = /iPad|iPhone|iPod/.test(ua) && !(window as any).MSStream;
+      const isInApp = /FBAN|FBAV|Instagram|Twitter|Slack|Telegram|WhatsApp|LINE|Gmail|Workplace/.test(ua);
+      
+      let errorMsg = '❌ متصفح الويب الحالي لا يدعم الاتصال بتقنية البلوتوث (Web Bluetooth).\n\n';
+      
+      if (isIOS) {
+        errorMsg += '💡 حل مشكلة نظام تشغيل آيفون (iOS / iPadOS):\n' +
+                    'شركة آبل (Apple) تمنع تشغيل البلوتوث نهائياً على كافة المتصفحات الافتراضية للآيفون (سواء Safari أو Chrome).\n\n' +
+                    '• الخيار الأمثل للآيفون:\n' +
+                    'يرجى تحميل المتصفح المخصص للطباعة اللاسلكية من متجر آب ستور مجاناً: متصفح **Bluefy** أو **WebBLE**، ثم افتح رابط التطبيق هذا بداخله وستتمكن من الاقتران بالطابعة فوراً.\n\n' +
+                    '• خيار بديل سريع:\n' +
+                    'استخدم أي هاتف أندرويد (Android) أو جهاز كمبيوتر محمول (Laptop) لديه بلوتوث وافتح التطبيق عبر متصفح **Google Chrome** الرسمي.\n\n' +
+                    '• خيار بديل بدون بلوتوث:\n' +
+                    'يمكنك دائماً تغيير خيار الطباعة الافتراضي من الأسفل إلى "طباعة عبر المتصفح" لإنشاء الفاتورة وتصديرها بصيغة PDF أو طباعتها مباشرة.';
+      } else if (isInApp) {
+        errorMsg += '💡 حل مشكلة المتصفح الداخلي بالتطبيقات (WhatsApp / Telegram):\n' +
+                    'لقد قمت بفتح الرابط من داخل متصفح مدمج في تطبيق آخر (مثل واتساب، تلغرام، أو فيسبوك). هذه التطبيقات المدمجة تمنع ميزات البلوتوث للحماية.\n\n' +
+                    '• الحل الفوري والوحيد:\n' +
+                    'يرجى نسخ رابط هذا التطبيق بالكامل ولصقه مباشرة داخل تطبيق متصفح **Google Chrome** الرئيسي على هاتفك، وستعمل خاصية الاقتران فوراً.';
+      } else {
+        errorMsg += '💡 المتطلبات اللازمة للطباعة عبر البلوتوث للويب:\n' +
+                    '• يرجى التأكد من استخدام متصفح **Google Chrome** أو **Edge** أو **Samsung Internet** الرسمي.\n' +
+                    '• تأكد من تشغيل البلوتوث في هاتفك وتفعيل الموقع الجغرافي (GPS) وإعطاء صلاحية الموقع والمشاركة لمتصفح كروم (حيث تشترط بعض أنظمة الأندرويد تفعيل الموقع لتفويض البحث عن أجهزة البلوتوث القريبة).';
+      }
+
+      this.updateState({ error: errorMsg });
       return false;
     }
 
@@ -240,8 +303,15 @@ class BLEPrinterController {
       let errorMsg = err.message || 'فشل الاتصال بالطابعة عبر البلوتوث. الرجاء المحاولة مرة أخرى.';
       
       // Specifically target iframe and permission policy restrictions
-      if (err.name === 'SecurityError' || errorMsg.includes('permissions policy') || errorMsg.includes('disallowed')) {
-        errorMsg = '❌ تم حظر بروتوكول البلوتوث (Web Bluetooth) بواسطة سياسة الحماية داخل نافذة المعاينة (iframe). يُرجى الضغط على زر "فتح في علامة تبويب جديدة" (Open in New Tab) بأعلى اليمين لتشغيل البرنامج في صفحة مستقلة ومنحه حق الوصول للطابعة الحرارية بنجاح.';
+      const lowerMsg = errorMsg.toLowerCase();
+      if (
+        err.name === 'SecurityError' || 
+        lowerMsg.includes('permissions policy') || 
+        lowerMsg.includes('disallowed') || 
+        lowerMsg.includes('permission') || 
+        lowerMsg.includes('security')
+      ) {
+        errorMsg = '❌ تم حظر بروتوكول البلوتوث (Web Bluetooth) بواسطة سياسة حماية نافذة المعاينة (iframe Sandbox).\n\n💡 الحل السهل والمضمون:\nيرجى الضغط على زر "فتح في علامة تبويب جديدة" (Open in New Tab) الموجود في الشريط العلوي الأخضر بأعلى جهة اليمين لتشغيل البرنامج في متصفح مستقل (مثل Google Chrome)، حيث يُسمح بالوصول الكامل والآمن لخاصية البلوتوث والاقتران بالطابعة الحرارية الميدانية فوراً وبنجاح.';
       }
 
       this.handleDisconnection();
@@ -256,6 +326,12 @@ class BLEPrinterController {
    * Verified if GATT is physically connected and characteristic is ready; if not, attempt auto-reconnect or full connect
    */
   public async ensureConnected(): Promise<boolean> {
+    const win = window as any;
+    if (win.AndroidPrinter || win.Android || win.PrintInterface || win.PrinterBridge) {
+      this.updateState({ isConnected: true, error: null });
+      return true;
+    }
+
     if (this.device && this.device.gatt && this.device.gatt.connected && this.writeCharacteristic) {
       this.updateState({ isConnected: true, error: null });
       return true;
@@ -835,6 +911,41 @@ class BLEPrinterController {
         statusMessage: 'جاري فحص حالة الاتصال بالطابعة الحرارية...', 
         progress: 10 
       });
+
+      const win = window as any;
+      const bridge = win.AndroidPrinter || win.Android || win.PrintInterface || win.PrinterBridge;
+      if (bridge) {
+        this.updateState({ 
+          statusMessage: 'جاري إعداد وإرسال الفاتورة عبر جسر الأندرويد المدمج...', 
+          progress: 50 
+        });
+        
+        try {
+          if (typeof bridge.printReceipt === 'function') {
+            bridge.printReceipt(JSON.stringify(receipt));
+          } else if (typeof bridge.print === 'function') {
+            bridge.print(JSON.stringify(receipt));
+          } else if (typeof bridge.printText === 'function') {
+            const receiptTitle = localStorage.getItem('receipt_title') || 'نظام مولدتي للخدمات الأهلية';
+            const receiptFooter = localStorage.getItem('receipt_footer') || 'شكراً لالتزامكم بالتسديد الشهري.';
+            const text = `${receiptTitle}\n====================\nرقم الوصل: ${receipt.invoiceNo}\nالاسم: ${receipt.subscriberName}\nالمبلغ: ${receipt.totalAmount.toLocaleString()} د.ع\n====================\n${receiptFooter}`;
+            bridge.printText(text);
+          } else {
+            bridge.print(receipt.invoiceNo, receipt.subscriberName, receipt.totalAmount);
+          }
+          
+          this.updateState({ 
+            statusMessage: 'تم بث وإرسال الفاتورة لخاصية الأندرويد بنجاح! 🎉', 
+            progress: 100 
+          });
+          setTimeout(() => {
+            this.updateState({ statusMessage: null, progress: 0 });
+          }, 2000);
+          return true;
+        } catch (bridgeErr: any) {
+          throw new Error(`تعذر الطباعة عبر جسر الأندرويد: ${bridgeErr.message || bridgeErr}`);
+        }
+      }
       
       const connected = await this.ensureConnected();
       if (!connected || !this.writeCharacteristic) {
