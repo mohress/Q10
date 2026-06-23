@@ -1460,19 +1460,22 @@ class BLEPrinterController {
             <div class="barcode">||||| ${receipt.invoiceNo} |||||</div>
             <div class="app-credit">نظام إدارة المولدات والتحصيل الميداني الذكي</div>
           </div>
-          <script>
-            window.onload = function() {
-              window.print();
-            };
-          </script>
         </body>
       </html>
     `);
     doc.close();
 
     setTimeout(() => {
-      iframe?.contentWindow?.focus();
-    }, 150);
+      if (iframe && iframe.contentWindow) {
+        try {
+          iframe.contentWindow.focus();
+          iframe.contentWindow.print();
+        } catch (e) {
+          console.error('Direct iframe print failed, falling back to window.print', e);
+          window.print();
+        }
+      }
+    }, 250);
 
     return true;
   }
