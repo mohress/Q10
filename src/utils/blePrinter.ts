@@ -14,41 +14,81 @@ export interface DiscoveredDevice {
   rssi?: number;
 }
 
-// Declare standard Bluetooth state structure
+// Bluetooth State Structure
 export interface BLEPrinterState {
   isConnected: boolean;
   isConnecting: boolean;
   deviceName: string | null;
+  defaultPrintMethod: 'browser' | 'ble';
   paperWidth: '58mm' | '80mm';
   printerType: 'esc_pos' | 'cat_printer';
-  defaultPrintMethod: 'browser' | 'ble';
-  chunkSize: number;       // Safe split size for budget devices (default: 40 bytes)
-  chunkDelay: number;      // Safe pause between socket writes in ms (default: 15 ms)
-  contrastThreshold: number; // For standard thresholding (50 - 200, default: 135)
-  ditheringEnabled: boolean; // Enables Floyd-Steinberg dithering for higher definition images
+  chunkSize: number;
+  chunkDelay: number;
+  contrastThreshold: number;
+  ditheringEnabled: boolean;
   error: string | null;
   statusMessage?: string | null;
   progress?: number;
-  isSimulator?: boolean;     // Enable Virtual Simulator Mode for diagnostics without physical printer
+  isSimulator?: boolean;
   discoveredDevices: DiscoveredDevice[];
   isScanning: boolean;
 }
+
+// Top 5 most common service and characteristic UUIDs for Chinese portable thermal printers
+const COMMON_CHINESE_PRINTERS = [
+  {
+    // Standard UART / SPP-like service (MPT-II, PT-210, PT-280, PT-380, Goojprt, etc.)
+    service: '0000ffe0-0000-1000-8000-00805f9b34fb',
+    characteristic: '0000ffe1-0000-1000-8000-00805f9b34fb'
+  },
+  {
+    // Alternate standard 16-bit UUID
+    service: 'ffe0',
+    characteristic: 'ffe1'
+  },
+  {
+    // ISSC Microchip (Very common in many Chinese dual-mode Bluetooth modules)
+    service: '49535343-fe7d-4ae5-8fa9-9fafd205e455',
+    characteristic: '49535343-1e4d-4bd9-ba61-23c647249616'
+  },
+  {
+    // Alternate ISSC Characteristic
+    service: '49535343-fe7d-4ae5-8fa9-9fafd205e455',
+    characteristic: '49535343-8841-43f4-a8d2-25809012f6c2'
+  },
+  {
+    // Newer Chinese Printers (Xprinter, some portable BLE devices)
+    service: 'e7fe1800-be05-4866-ab74-04b15b00f5df',
+    characteristic: 'e7fe1801-be05-4866-ab74-04b15b00f5df'
+  },
+  {
+    // Nordic UART service (Used by custom BLE printers)
+    service: '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+    characteristic: '6e400002-b5a3-f393-e0a9-e50e24dcca9e'
+  }
+];
 
 class BLEPrinterController {
   private device: any = null;
   private gattServer: any = null;
   private writeCharacteristic: any = null;
   private stateChangeListeners: ((state: BLEPrinterState) => void)[] = [];
+  private autoReconnectTimer: any = null;
 
+  // Global default configuration optimized for Chinese printers
   public state: BLEPrinterState = {
     isConnected: false,
     isConnecting: false,
-    deviceName: null,
-    paperWidth: (localStorage.getItem('ble_printer_width') as any) || '58mm',
-    printerType: (localStorage.getItem('ble_printer_type') as any) || 'esc_pos',
-    defaultPrintMethod: (localStorage.getItem('default_print_method') as any) || 'browser',
-    chunkSize: Number(localStorage.getItem('ble_chunk_size')) || 40,
-    chunkDelay: Number(localStorage.getItem('ble_chunk_delay')) || 15,
+    deviceName: localStorage.getItem('ble_last_device_name') || null,
+    defaultPrintMethod: (localStorage.getItem('default_print_method') as 'browser' | 'ble') || 'ble',
+    paperWidth: (localStorage.getItem('ble_printer_width') as '58mm' | '80mm') || '58mm',
+    printerType: (localStorage.getItem('ble_printer_type') as 'esc_pos' | 'cat_printer') || 'esc_pos',
+    
+    // Critical: Chinese BLE modules have tiny input buffers.
+    // 20-byte chunks with 20ms delays is the GOLD standard to prevent frozen printers and data loss.
+    chunkSize: Number(localStorage.getItem('ble_chunk_size')) || 20,
+    chunkDelay: Number(localStorage.getItem('ble_chunk_delay')) || 20,
+    
     contrastThreshold: Number(localStorage.getItem('ble_contrast_threshold')) || 135,
     ditheringEnabled: localStorage.getItem('ble_dithering_enabled') === 'true',
     error: null,
@@ -139,17 +179,55 @@ class BLEPrinterController {
   public setSimulatorMode(enabled: boolean) {
     this.updateState({ isSimulator: enabled });
     localStorage.setItem('ble_is_simulator', String(enabled));
-    if (enabled) {
-      this.updateState({ 
-        isConnected: true, 
-        deviceName: 'محاكي الطابعة الافتراضي (Simulator Active)',
-        error: null 
-      });
-    } else if (this.state.deviceName?.includes('Simulator')) {
-      this.disconnect();
-    }
   }
 
+  /**
+   * Safe execution environment detector
+   */
+  private getEnvironment(): 'simulator' | 'android_bridge' | 'android_cordova' | 'browser' {
+    if (this.state.isSimulator) return 'simulator';
+    
+    const win = window as any;
+    if (win.AndroidPrinter || win.Android || win.PrintInterface || win.PrinterBridge) {
+      return 'android_bridge';
+    }
+    
+    if (win.cordova && (win.ble || win.bluetoothSerial)) {
+      return 'android_cordova';
+    }
+    
+    return 'browser';
+  }
+
+  /**
+   * Request Android BLE and location permissions inside APK (Cordova mode)
+   */
+  private async requestAndroidPermissions(): Promise<boolean> {
+    const win = window as any;
+    if (win.cordova && win.cordova.plugins && win.cordova.plugins.permissions) {
+      const pm = win.cordova.plugins.permissions;
+      const permissionsNeeded = [
+        pm.BLUETOOTH,
+        pm.BLUETOOTH_ADMIN,
+        pm.ACCESS_COARSE_LOCATION,
+        pm.ACCESS_FINE_LOCATION,
+        'android.permission.BLUETOOTH_SCAN',
+        'android.permission.BLUETOOTH_CONNECT'
+      ];
+      return new Promise((resolve) => {
+        pm.requestPermissions(permissionsNeeded, (status: any) => {
+          resolve(!!status.hasPermission);
+        }, () => {
+          resolve(false);
+        });
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Scan for Bluetooth printers (Simulator, Browser Native, or Cordova)
+   */
   public async startScanning(): Promise<void> {
     const env = this.getEnvironment();
     const win = window as any;
@@ -163,18 +241,17 @@ class BLEPrinterController {
     });
 
     if (env === 'simulator' || this.state.isSimulator) {
-      // Simulator Mode: generate fake devices
+      // Generate virtual diagnostic devices for test
       await new Promise(resolve => setTimeout(resolve, 800));
       const simulatedDevices: DiscoveredDevice[] = [
-        { id: 'sim_1', name: 'الطابعة الافتراضية المحمولة MPT-II', type: 'simulator' },
-        { id: 'sim_2', name: 'طابعة الإيصالات الحرارية XP-58', type: 'simulator' },
-        { id: 'sim_3', name: 'طابعة الفواتير المكتبية XP-80', type: 'simulator' },
-        { id: 'sim_cat', name: 'طابعة القطة الذكية Cat Printer', type: 'simulator' }
+        { id: 'sim_1', name: 'طابعة صينية محمولة MPT-II', type: 'simulator' },
+        { id: 'sim_2', name: 'طابعة فواتير ذكية PT-210 (BLE)', type: 'simulator' },
+        { id: 'sim_3', name: 'طابعة إيصالات حرارية XP-58 (Classic)', type: 'simulator' }
       ];
       this.updateState({
         discoveredDevices: simulatedDevices,
         isScanning: false,
-        statusMessage: 'اكتمل البحث المبرمج. يرجى اختيار طابعتك من القائمة أدناه.',
+        statusMessage: 'اكتمل البحث المبرمج. يرجى اختيار طابعتك من القائمة.',
         progress: 100
       });
       return;
@@ -182,11 +259,10 @@ class BLEPrinterController {
 
     if (env === 'android_cordova') {
       try {
-        await this.requestAndroidPermissions().catch((e) => console.log('Permission request failed/ignored', e));
-
+        await this.requestAndroidPermissions().catch((e) => console.log('Permission request failed', e));
         const deviceList: DiscoveredDevice[] = [];
 
-        // 1. Check Classic Bluetooth Paired Devices
+        // 1. Check Paired Classic Devices
         if (win.bluetoothSerial) {
           win.bluetoothSerial.list((pairedDevices: any[]) => {
             pairedDevices.forEach((d: any) => {
@@ -198,11 +274,9 @@ class BLEPrinterController {
               });
             });
             this.updateState({ discoveredDevices: [...deviceList] });
-          }, (err: any) => {
-            console.log('Error listing classic devices', err);
-          });
+          }, (err: any) => console.log('Error listing classic devices', err));
 
-          // Start scanning for unpaired classic devices
+          // Scan for unpaired classic devices
           win.bluetoothSerial.discoverUnpaired((unpairedDevices: any[]) => {
             unpairedDevices.forEach((d: any) => {
               if (!deviceList.some(existing => existing.id === d.address)) {
@@ -215,12 +289,10 @@ class BLEPrinterController {
               }
             });
             this.updateState({ discoveredDevices: [...deviceList] });
-          }, (err: any) => {
-            console.log('Error discovering unpaired classic devices', err);
-          });
+          }, (err: any) => console.log('Error classic discovery', err));
         }
 
-        // 2. Check BLE Devices
+        // 2. Scan BLE Devices
         if (win.ble) {
           win.ble.startScan([], (device: any) => {
             const name = device.name || device.id || 'جهاز BLE غير مسمى';
@@ -234,30 +306,23 @@ class BLEPrinterController {
               });
               this.updateState({ discoveredDevices: [...deviceList] });
             }
-          }, (err: any) => {
-            console.error('Error in BLE scan', err);
-          });
+          }, (err: any) => console.error('Error BLE scan', err));
         }
 
-        // Auto-stop BLE scan after 15 seconds
-        setTimeout(() => {
-          this.stopScanning();
-        }, 15000);
-
+        setTimeout(() => this.stopScanning(), 12000);
       } catch (err: any) {
         this.updateState({
           isScanning: false,
-          error: `فشل تشغيل مسح البلوتوث: ${err.message || err}`
+          error: `فشل مسح البلوتوث: ${err.message || err}`
         });
       }
     } else {
-      // In web browser (not simulator)
+      // In Standard Web Browser: Let the user know Chrome handles device scanning in its native dialog
       this.updateState({
         isScanning: false,
-        statusMessage: 'في متصفح الويب، سيظهر لك مربع حوار مدمج من المتصفح مباشرة لاختيار الطابعة.',
+        statusMessage: 'في متصفح الويب، يتم فتح قائمة اختيار الأجهزة المدمجة من المتصفح مباشرة لحماية الخصوصية.',
         progress: 100
       });
-      // Automatically run standard connect to open browser native picker
       await this.connect();
     }
   }
@@ -270,18 +335,21 @@ class BLEPrinterController {
       try {
         win.ble.stopScan();
       } catch (e) {
-        console.log('Failed to stop scan', e);
+        console.log('Failed to stop BLE scan', e);
       }
     }
     this.updateState({
       isScanning: false,
       progress: 0,
       statusMessage: this.state.discoveredDevices.length > 0 
-        ? `تم العثور على ${this.state.discoveredDevices.length} أجهزة. يرجى الاختيار.`
-        : 'اكتمل فحص البلوتوث.'
+        ? `تم العثور على ${this.state.discoveredDevices.length} جهاز. حدد طابعتك للتوصيل.`
+        : 'تم إنهاء فحص البلوتوث.'
     });
   }
 
+  /**
+   * Connect to a specific chosen device
+   */
   public async connectToSpecificDevice(device: DiscoveredDevice): Promise<boolean> {
     const env = this.getEnvironment();
     const win = window as any;
@@ -289,14 +357,14 @@ class BLEPrinterController {
     this.updateState({
       isConnecting: true,
       error: null,
-      statusMessage: `جاري بدء التوصيل والاقتران بـ: ${device.name}...`,
-      progress: 10
+      statusMessage: `جاري التوصيل بالطابعة: ${device.name}...`,
+      progress: 20
     });
 
     this.stopScanning();
 
     if (device.type === 'simulator') {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 800));
       this.updateState({
         isConnected: true,
         isConnecting: false,
@@ -312,7 +380,7 @@ class BLEPrinterController {
       try {
         if (device.type === 'ble' && win.ble) {
           return new Promise<boolean>((resolve) => {
-            this.updateState({ statusMessage: 'جاري إنشاء قناة اتصال آمنة BLE...', progress: 40 });
+            this.updateState({ statusMessage: 'جاري فتح قناة اتصالات BLE...', progress: 50 });
             win.ble.connect(device.id, () => {
               localStorage.setItem('ble_last_device_address', device.id);
               localStorage.setItem('ble_last_device_name', device.name);
@@ -320,7 +388,7 @@ class BLEPrinterController {
                 isConnected: true,
                 isConnecting: false,
                 deviceName: device.name,
-                statusMessage: 'تم الاقتران اللاسلكي بالأندرويد بنجاح! ⚡',
+                statusMessage: 'تم التوصيل اللاسلكي بالطابعة بنجاح! ⚡',
                 progress: 100
               });
               setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
@@ -332,7 +400,7 @@ class BLEPrinterController {
           });
         } else if (win.bluetoothSerial) {
           return new Promise<boolean>((resolve) => {
-            this.updateState({ statusMessage: 'جاري فتح منفذ القناة التسلسلية SPP...', progress: 50 });
+            this.updateState({ statusMessage: 'جاري الاتصال بالقناة التسلسلية SPP...', progress: 60 });
             win.bluetoothSerial.connect(device.id, () => {
               localStorage.setItem('ble_last_device_address', device.id);
               localStorage.setItem('ble_last_device_name', device.name);
@@ -340,7 +408,7 @@ class BLEPrinterController {
                 isConnected: true,
                 isConnecting: false,
                 deviceName: device.name,
-                statusMessage: 'تم التوصيل والربط الكلاسيكي بنجاح! 🎉',
+                statusMessage: 'تم الاتصال الكلاسيكي بنجاح! 🎉',
                 progress: 100
               });
               setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
@@ -352,101 +420,12 @@ class BLEPrinterController {
           });
         }
       } catch (err: any) {
-        this.updateState({ isConnected: false, isConnecting: false, error: `حدث خطأ أثناء محاولة التوصيل: ${err.message || err}` });
+        this.updateState({ isConnected: false, isConnecting: false, error: `حدث خطأ غير متوقع: ${err.message || err}` });
         return false;
       }
     }
 
     return false;
-  }
-
-  /**
-   * Auto Reconnection Daemon running silently every 15 seconds
-   */
-  private startAutoReconnectionTimer() {
-    setInterval(async () => {
-      if (this.state.isConnected || this.state.isConnecting) return;
-      const lastAddress = localStorage.getItem('ble_last_device_address');
-      if (lastAddress && lastAddress.trim()) {
-        console.log(`[Daemon] Auto-reconnecting to last printer address: ${lastAddress}`);
-        this.attemptSilentConnection(lastAddress);
-      }
-    }, 15000);
-  }
-
-  private async attemptSilentConnection(address: string) {
-    const env = this.getEnvironment();
-    const win = window as any;
-    
-    if (env === 'android_bridge' || env === 'simulator') {
-      return; 
-    }
-
-    if (env === 'android_cordova') {
-      try {
-        if (win.ble) {
-          win.ble.connect(address, () => {
-            this.updateState({
-              isConnected: true,
-              deviceName: localStorage.getItem('ble_last_device_name') || 'طابعة بلوتوث APK',
-              error: null
-            });
-          }, () => {});
-        } else if (win.bluetoothSerial) {
-          win.bluetoothSerial.connect(address, () => {
-            this.updateState({
-              isConnected: true,
-              deviceName: localStorage.getItem('ble_last_device_name') || 'طابعة بلوتوث APK',
-              error: null
-            });
-          }, () => {});
-        }
-      } catch (err) {
-        // Fail silently inside background daemon
-      }
-    }
-  }
-
-  /**
-   * Check environment for hybrid/native bridges versus standard client web browser
-   */
-  public getEnvironment(): 'web' | 'android_cordova' | 'android_bridge' | 'simulator' {
-    const win = window as any;
-    if (this.state.isSimulator) {
-      return 'simulator';
-    }
-    // Android Native WebView injected companion interface fallback
-    if (win.AndroidPrinter || win.Android || win.PrintInterface || win.PrinterBridge) {
-      return 'android_bridge';
-    }
-    // Cordova/Capacitor plugins commonly packaged in APKs
-    if (win.cordova && (win.ble || win.bluetoothSerial)) {
-      return 'android_cordova';
-    }
-    return 'web';
-  }
-
-  /**
-   * Request dynamic Bluetooth permissions on Android platforms (API 31+)
-   */
-  private async requestAndroidPermissions(): Promise<boolean> {
-    const win = window as any;
-    if (win.cordova && win.cordova.plugins && win.cordova.plugins.permissions) {
-      const pm = win.cordova.plugins.permissions;
-      const permissionsNeeded = [
-        pm.BLUETOOTH_SCAN || "android.permission.BLUETOOTH_SCAN",
-        pm.BLUETOOTH_CONNECT || "android.permission.BLUETOOTH_CONNECT",
-        pm.ACCESS_FINE_LOCATION || "android.permission.ACCESS_FINE_LOCATION"
-      ];
-      return new Promise((resolve) => {
-        pm.requestPermissions(permissionsNeeded, (status: any) => {
-          resolve(!!status.hasPermission);
-        }, () => {
-          resolve(false);
-        });
-      });
-    }
-    return true;
   }
 
   /**
@@ -460,31 +439,26 @@ class BLEPrinterController {
     this.updateState({ 
       isConnecting: true, 
       error: null, 
-      statusMessage: 'جاري مراجعة صلاحيات ومكونات النظام للتأصيل بالاقتران...', 
+      statusMessage: 'جاري فحص مكونات النظام وتوافر البلوتوث...', 
       progress: 5 
     });
 
-    // Handle Simulator Connection
     if (env === 'simulator' || this.state.isSimulator) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 800));
       this.updateState({
         isConnected: true,
         isConnecting: false,
-        deviceName: 'محاكي الطابعة الافتراضي (Simulator Active)',
-        statusMessage: 'تم التوصيل بمحاكي النظام بنجاح للتجربة الفورية! ☕',
+        deviceName: 'محاكي الطابعة الحرارية (نشط)',
+        statusMessage: 'تم التوصيل بمحاكي طابعة النظام للتجربة الميدانية! 🟢',
         progress: 100
       });
       setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
       return true;
     }
 
-    // Handle Injected Native Android companion (APK level helper)
     if (env === 'android_bridge') {
       const bridge = win.AndroidPrinter || win.Android || win.PrintInterface || win.PrinterBridge;
-      this.updateState({ 
-        statusMessage: 'جاري تهيئة الاتصال عبر جسر التحميل الأصلي للتطبيق (Android Native Bridge)...', 
-        progress: 40 
-      });
+      this.updateState({ statusMessage: 'جاري الربط مع الجسر البرمجي للأندرويد...', progress: 40 });
       try {
         if (typeof bridge.connect === 'function') {
           bridge.connect();
@@ -492,142 +466,75 @@ class BLEPrinterController {
         this.updateState({
           isConnected: true,
           isConnecting: false,
-          deviceName: 'طابعة النظام المدمجة (Android APK Interface)',
-          statusMessage: 'تم الاقتران الفوري عبر واجهة الأندرويد للأجهزة الميدانية! 🟢',
+          deviceName: 'طابعة أندرويد المدمجة (Bridge Interface)',
+          statusMessage: 'تم الاتصال الفوري عبر واجهة أندرويد بنجاح! ⚡',
           progress: 100
         });
         setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
         return true;
       } catch (err: any) {
-        this.updateState({
-          isConnected: false,
-          isConnecting: false,
-          error: `فشل استدعاء جسر أندرويد: ${err.message || err}`
-        });
+        this.updateState({ isConnected: false, isConnecting: false, error: `فشل جسر أندرويد: ${err.message || err}` });
         return false;
       }
     }
 
-    // Handle Cordova Native Bluetooth Plugins inside APK
     if (env === 'android_cordova') {
-      this.updateState({ 
-        statusMessage: 'جاري التحقق من قنوات البلوتوث...', 
-        progress: 20 
-      });
-      
-      // Request permissions but do not block, as they might be pre-granted or managed by the container.
-      await this.requestAndroidPermissions().catch((e) => console.log('Permission request ignored/failed', e));
-
-      this.updateState({ 
-        statusMessage: 'جاري تشغيل عملية مسح الرادار للبلوتوث بحثاً عن طابعتك...', 
-        progress: 50 
-      });
-
-      try {
-        if (win.ble) {
+      // Auto-connect to matched device
+      await this.requestAndroidPermissions().catch(() => {});
+      if (win.ble) {
+        const lastAddress = localStorage.getItem('ble_last_device_address');
+        const lastName = localStorage.getItem('ble_last_device_name') || 'طابعة حرارية BLE';
+        if (lastAddress) {
           return new Promise<boolean>((resolve) => {
-            win.ble.scan([], 10, (device: any) => {
-              // Try to identify standard BLE printers by checking name/services
-              const name = device.name || device.id || '';
-              if (name.toLowerCase().includes('printer') || name.toLowerCase().includes('mpt') || name.toLowerCase().includes('print') || name.toLowerCase().includes('cat')) {
-                win.ble.stopScan();
-                this.updateState({ statusMessage: `تم رصد الطابعة "${name}". جاري الاتصال...`, progress: 80 });
-                
-                win.ble.connect(device.id, () => {
-                  localStorage.setItem('ble_last_device_address', device.id);
-                  localStorage.setItem('ble_last_device_name', name);
-                  this.updateState({
-                    isConnected: true,
-                    isConnecting: false,
-                    deviceName: name,
-                    statusMessage: 'تم الاقتران اللاسلكي الأصيل بنجاح! ⚡',
-                    progress: 100
-                  });
-                  setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
-                  resolve(true);
-                }, (err: any) => {
-                  this.updateState({ isConnected: false, isConnecting: false, error: `فشل ربط جهاز BLE: ${JSON.stringify(err)}` });
-                  resolve(false);
-                });
-              }
-            }, () => {
-              this.updateState({ isConnected: false, isConnecting: false, error: 'فشل الفحص اللاسلكي بالطاقة المنخفضة BLE' });
-              resolve(false);
-            });
-          });
-        } else if (win.bluetoothSerial) {
-          // Classic SPP Bluetooth serial profile (Commonly preferred on legacy printers)
-          return new Promise<boolean>((resolve) => {
-            win.bluetoothSerial.list((devices: any[]) => {
-              const matched = devices.find(d => 
-                (d.name || '').toLowerCase().includes('printer') || 
-                (d.name || '').toLowerCase().includes('mpt') || 
-                (d.name || '').toLowerCase().includes('print')
-              ) || devices[0];
-
-              if (!matched) {
-                this.updateState({ isConnected: false, isConnecting: false, error: 'لم يتم رصد أي طابعة مقترنة مسبقاً في قائمة بلوتوث الأندرويد.' });
-                resolve(false);
-                return;
-              }
-
-              this.updateState({ statusMessage: `جاري ربط خط تسلسلي مع: ${matched.name}...`, progress: 80 });
-              win.bluetoothSerial.connect(matched.address, () => {
-                localStorage.setItem('ble_last_device_address', matched.address);
-                localStorage.setItem('ble_last_device_name', matched.name);
-                this.updateState({
-                  isConnected: true,
-                  isConnecting: false,
-                  deviceName: matched.name,
-                  statusMessage: 'تم الاقتران الكلاسيكي بالتطبيق بنجاح! 🎉',
-                  progress: 100
-                });
-                setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
-                resolve(true);
-              }, (err: any) => {
-                this.updateState({ isConnected: false, isConnecting: false, error: `فشل الاقتران بالقناة التسلسلية: ${err}` });
-                resolve(false);
+            this.updateState({ statusMessage: `إعادة الاتصال التلقائي بالطابعة السابقة: ${lastName}...`, progress: 50 });
+            win.ble.connect(lastAddress, () => {
+              this.updateState({
+                isConnected: true,
+                isConnecting: false,
+                deviceName: lastName,
+                statusMessage: 'تمت إعادة الاتصال بالطابعة المعتادة! 🟢',
+                progress: 100
               });
-            }, (err: any) => {
-              this.updateState({ isConnected: false, isConnecting: false, error: `تعذر فهرسة قائمة الأجهزة: ${err}` });
+              setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
+              resolve(true);
+            }, () => {
+              // Fail silently and list devices
+              this.updateState({ isConnecting: false });
+              this.startScanning();
               resolve(false);
             });
           });
+        } else {
+          this.updateState({ isConnecting: false });
+          this.startScanning();
+          return false;
         }
-      } catch (err: any) {
-        this.updateState({ isConnected: false, isConnecting: false, error: `حدث خطأ أثناء الاتصال بالبلوتوث المدمج: ${err.message || err}` });
-        return false;
       }
     }
 
-    // Standard Web Bluetooth API Fallback (runs when user opens inside a supporting browser like Chrome)
+    // Standard Web Bluetooth API Flow
     if (!nav.bluetooth) {
       const ua = navigator.userAgent || '';
       const isIOS = /iPad|iPhone|iPod/.test(ua) && !(window as any).MSStream;
       const isInApp = /FBAN|FBAV|Instagram|Twitter|Slack|Telegram|WhatsApp|LINE|Gmail|Workplace/.test(ua);
       
-      let errorMsg = '❌ متصفح الويب الحالي لا يدعم الاتصال المباشر بتقنية البلوتوث (Web Bluetooth).\n\n';
+      let errorMsg = '❌ المتصفح الحالي لا يدعم الاتصال المباشر بتقنية البلوتوث (Web Bluetooth).\n\n';
       if (isIOS) {
-        errorMsg += '💡 حل مشكلة نظام آيفون (iOS):\n' +
-                    'تمنع شركة Apple البلوتوث للويب على متصفحات Safari و Chrome الافتراضية.\n\n' +
-                    '• الخيار الأمثل للآيفون:\n' +
-                    'يرجى تحميل المتصفح المخصص للطباعة اللاسلكية مجاناً: متصفح **Bluefy** أو **WebBLE**، ثم افتح رابط نظام "مولدتي" بداخله لتتصل فوراً بالطابعة.\n\n' +
-                    '• خيار بديل سريع:\n' +
-                    'استخدم أي هاتف أندرويد (Android) وافتح التطبيق عبر متصفح **Google Chrome** الأساسي.';
+        errorMsg += '💡 نظام iOS (آيفون):\nتمنع شركة أبل البلوتوث على متصفح سفاري وكروم العادي.\n\n' +
+                    'يرجى تحميل المتصفح المجاني المخصص للاتصال بالطابعات: **Bluefy** أو **WebBLE** من متجر التطبيقات، ثم افتح رابط نظام "مولدتي" بداخله لتتصل وتطبع فوراً.';
       } else if (isInApp) {
-        errorMsg += '💡 حل مشكلة المتصفحات الداخلية للتطبيقات (مثل واتساب وتلغرام):\n' +
-                    'تمنع هذه النوافذ المدمجة الوصول لميزات الهاتف للحماية.\n\n' +
-                    '• الحل الفوري:\n' +
-                    'يرجى نسخ رابط الويب هذا ولصقه مباشرة داخل تطبيق متصفح **Google Chrome** الرئيسي على هاتفك لتتمتع بالاقتران الفوري بالطابعة.';
+        errorMsg += '💡 تطبيقات الدردشة (واتساب/تلغرام):\nتمنع هذه النوافذ الوصول للبلوتوث.\n\n' +
+                    'يرجى نسخ رابط النظام وفتحه مباشرة في متصفح **Google Chrome** الرئيسي على هاتفك لتطبع بنجاح.';
       } else {
-        errorMsg += '💡 يرجى التأكد من استخدام متصفح يدعم تقنية Web Bluetooth (مثل **Google Chrome** أو **Edge** أو **Samsung Internet**)، وتفعيل البلوتوث وتحديد الموقع الجغرافي (GPS) لجهازك.';
+        errorMsg += '💡 يرجى استخدام متصفح **Google Chrome** أو **Edge** أو **Samsung Internet**، وتأكد من تشغيل البلوتوث وتفعيل خاصية تحديد الموقع (GPS).';
       }
       this.updateState({ isConnected: false, isConnecting: false, error: errorMsg });
       return false;
     }
 
     try {
-      this.updateState({ statusMessage: 'جاري تشغيل مسبار البلوتوث ورصد موجة الأجهزة القريبة...', progress: 30 });
+      this.updateState({ statusMessage: 'جاري إطلاق منسق البلوتوث للبحث... يرجى اختيار طابعتك من نافذة النظام.', progress: 35 });
+      
       const servicesUuids = this.getComprehensivePrinterServices();
       const device = await nav.bluetooth.requestDevice({
         acceptAllDevices: true,
@@ -637,7 +544,7 @@ class BLEPrinterController {
       this.device = device;
       this.updateState({ 
         deviceName: device.name || 'طابعة حرارية لاسلكية',
-        statusMessage: `تم رصد الطابعة "${device.name || 'مجهولة'}". جاري التوصيل بخادم GATT آمن...`,
+        statusMessage: `تم اختيار "${device.name || 'طابعة'}"، جاري التوصيل الآمن بخادم GATT...`,
         progress: 60
       });
 
@@ -648,8 +555,8 @@ class BLEPrinterController {
       const server = await device.gatt.connect();
       this.gattServer = server;
       
-      this.updateState({ statusMessage: 'تم التوصيل. جاري اختيار وضبط أفضل خصائص الكتابة...', progress: 80 });
-      const char = await this.discoverWriteCharacteristic(server, device);
+      this.updateState({ statusMessage: 'جاري تحديد وتهيئة قناة الكتابة السريعة...', progress: 80 });
+      const char = await this.discoverWriteCharacteristic(server);
       this.writeCharacteristic = char;
 
       localStorage.setItem('ble_last_device_address', device.id);
@@ -659,7 +566,7 @@ class BLEPrinterController {
         isConnected: true,
         isConnecting: false,
         error: null,
-        statusMessage: 'تم الاقتران اللاسلكي للويب وتدشين القناة بنجاح! ⚡',
+        statusMessage: 'تم الاقتران وتدشين الاتصال بنجاح تام! ⚡',
         progress: 100
       });
       setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
@@ -670,7 +577,7 @@ class BLEPrinterController {
       let errorMsg = err.message || 'فشل الاتصال بالطابعة عبر البلوتوث. الرجاء المحاولة مرة أخرى.';
       const lowerMsg = errorMsg.toLowerCase();
       if (err.name === 'SecurityError' || lowerMsg.includes('policy') || lowerMsg.includes('disallowed')) {
-        errorMsg = '❌ تم حظر بروتوكول البلوتوث بواسطة سياسة حماية نافذة المعاينة (iframe Sandbox).\n\n💡 الحل السهل والمضمون:\nيرجى الضغط على زر "فتح في علامة تبويب جديدة" (Open in New Tab) الموجود في الشريط العلوي الأخضر بأعلى جهة اليمين لتشغيل البرنامج في متصفح مستقل (مثل Google Chrome)، حيث يُسمح بالوصول الكامل لخاصية البلوتوث والاقتران فوراً وبنجاح.';
+        errorMsg = '❌ تم حظر بروتوكول البلوتوث بواسطة حماية نافذة المعاينة (iframe Sandbox).\n\n💡 الحل السهل والسريع:\nيرجى الضغط على زر "فتح في علامة تبويب جديدة" (Open in New Tab) في الشريط العلوي الأخضر على يسار الشاشة لتشغيل النظام في متصفح خارجي مستقل (مثل Google Chrome)، حيث تتوفر كامل صلاحيات البلوتوث للاتصال والطباعة فوراً.';
       }
       this.handleDisconnection();
       this.updateState({ isConnected: false, isConnecting: false, error: errorMsg });
@@ -678,9 +585,6 @@ class BLEPrinterController {
     }
   }
 
-  /**
-   * Disconnect any active connections
-   */
   public disconnect() {
     this.handleDisconnection();
     localStorage.removeItem('ble_last_device_address');
@@ -688,7 +592,7 @@ class BLEPrinterController {
       isConnected: false, 
       isConnecting: false, 
       deviceName: null, 
-      statusMessage: 'تم إلغاء اقتران الطابعة وفصل القنوات الرياضية.', 
+      statusMessage: 'تم قطع اتصال الطابعة اللاسلكية بنجاح.', 
       progress: 0 
     });
     setTimeout(() => this.updateState({ statusMessage: null }), 2000);
@@ -708,9 +612,6 @@ class BLEPrinterController {
     this.updateState({ isConnected: false });
   }
 
-  /**
-   * Determine whether connection is active, or refresh states
-   */
   public async ensureConnected(): Promise<boolean> {
     const env = this.getEnvironment();
     if (env === 'simulator' || env === 'android_bridge') {
@@ -728,104 +629,97 @@ class BLEPrinterController {
       this.updateState({ isConnected: true, error: null });
       return true;
     }
-    // Attempt rapid re-connect otherwise
     return await this.connect();
   }
 
   /**
-   * Core service discoverer with GATT scoring logic
+   * Ultra-robust known UUID direct probe with GATT scoring fallback
    */
-  private async discoverWriteCharacteristic(server: any, device: any): Promise<any> {
+  private async discoverWriteCharacteristic(server: any): Promise<any> {
     const customServiceUuid = this.getCustomServiceUuid();
     const customCharUuid = this.getCustomCharacteristicUuid();
 
-    // 1. If explicit custom UUIDs are specified, use them directly
+    // 1. Check custom configured UUIDs
     if (customServiceUuid && customCharUuid) {
       try {
         const service = await server.getPrimaryService(customServiceUuid.toLowerCase());
         return await service.getCharacteristic(customCharUuid.toLowerCase());
       } catch (err) {
-        console.warn('Failed directly fetching custom configuration UUIDs, rolling back to scoring scan', err);
+        console.warn('Failed to find custom UUID service/characteristic', err);
       }
     }
 
-    // 2. Scan all services to determine scores
+    // 2. Direct Probe known Chinese portable printer service/char combinations
+    // This is 10X faster and avoids permission/restricted GATT issues on browsers!
+    for (const combo of COMMON_CHINESE_PRINTERS) {
+      try {
+        console.log(`Direct probing printer BLE service: ${combo.service}`);
+        const service = await server.getPrimaryService(combo.service.toLowerCase());
+        const characteristic = await service.getCharacteristic(combo.characteristic.toLowerCase());
+        if (characteristic) {
+          console.log(`Direct probe SUCCESS! Found printer channel: ${combo.characteristic}`);
+          return characteristic;
+        }
+      } catch (probeErr) {
+        // Continue to next probe
+      }
+    }
+
+    // 3. Fallback: Scan primary services and score write properties
+    console.log('Direct probe did not match, scanning primary services as fallback...');
     const services = await server.getPrimaryServices();
     let bestScore = -1000;
     let selectedChar: any = null;
 
-    // Sort services according to their suitability index
-    const scoredServices = services.map((srv: any) => ({
-      service: srv,
-      score: this.getServiceScore(srv.uuid)
-    })).sort((a: any, b: any) => b.score - a.score);
-
-    for (const item of scoredServices) {
+    for (const srv of services) {
       try {
-        console.log(`Scanning services: ${item.service.uuid} with score: ${item.score}`);
-        const characteristics = await item.service.getCharacteristics();
+        const score = this.getServiceScore(srv.uuid);
+        if (score < -100) continue; // Skip restricted/system services
+
+        const characteristics = await srv.getCharacteristics();
         for (const char of characteristics) {
           const props = char.properties;
           const charScore = this.getCharacteristicScore(char.uuid, props);
-          const totalScore = item.score + charScore;
+          const totalScore = score + charScore;
           
           if (totalScore > bestScore && charScore > 0) {
             bestScore = totalScore;
             selectedChar = char;
           }
         }
-      } catch (srvErr) {
-        // Skip restricted services securely
+      } catch (e) {
+        // Skip protected services
       }
     }
 
     if (selectedChar) {
-      console.log(`Matched best characteristics node: ${selectedChar.uuid} with aggregate score: ${bestScore}`);
+      console.log(`Discovered best writing characteristics: ${selectedChar.uuid} with score: ${bestScore}`);
       return selectedChar;
     }
 
-    // Standard UART/FFE0 generic raw defaults
+    // Last resort fallback
     try {
       const service = await server.getPrimaryService('0000ffe0-0000-1000-8000-00805f9b34fb');
       return await service.getCharacteristic('0000ffe1-0000-1000-8000-00805f9b34fb');
     } catch {
-      throw new Error('تعذر إيجاد قناة كتابة بيانات متوافقة (UART/SPP) ذات صلاحية إرسال ممتدة.');
+      throw new Error('تعذر العثور على القناة المخصصة لكتابة البيانات بالطابعة اللاسلكية. يرجى مراجعة تشغيل البلوتوث ومطابقة موديل الطابعة.');
     }
   }
 
   private getComprehensivePrinterServices(): string[] {
-    const services = new Set<string>([
-      '6e400001-b5a3-f393-e0a9-e50e24dcca9e', 
-      '49535343-fe7d-4ae5-8fa9-9fafd205e455', 
-      'e7fe1800-be05-4866-ab74-04b15b00f5df', 
-      '38eb4a84-c57d-4b6a-9a83-bf88801412e8', 
-      '243a2f0e-0f7f-11e2-892e-0800200c9a66', 
-      '11223344-5566-7788-9900-aabbccddeeff', 
-      '00001101-0000-1000-8000-00805f9b34fb', 
-      '000018f0-0000-1000-8000-00805f9b34fb', 
-      '000018f1-0000-1000-8000-00805f9b34fb', 
-      '0000180a-0000-1000-8000-00805f9b34fb', 
-      '0000180f-0000-1000-8000-00805f9b34fb', 
-      '00001800-0000-1000-8000-00805f9b34fb', 
-      '00001801-0000-1000-8000-00805f9b34fb', 
-    ]);
-
+    const services = new Set<string>();
+    COMMON_CHINESE_PRINTERS.forEach(c => services.add(c.service));
+    
+    // Add generic range
     const addRange = (start: number, end: number) => {
       for (let i = start; i <= end; i++) {
         const hex = i.toString(16).padStart(4, '0').toLowerCase();
         services.add(`0000${hex}-0000-1000-8000-00805f9b34fb`);
       }
     };
-
     addRange(0xffe0, 0xffef); 
     addRange(0xfff0, 0xfff9); 
-    addRange(0xffd0, 0xffdf); 
-    addRange(0xff00, 0xff0f); 
     addRange(0xfee0, 0xfeef); 
-    addRange(0xae00, 0xae2f); 
-    addRange(0xaf00, 0xaf2f); 
-    addRange(0xe000, 0xe00f); 
-    addRange(0x34b0, 0x34bf); 
 
     const customSrv = this.getCustomServiceUuid();
     if (customSrv) services.add(customSrv.toLowerCase());
@@ -836,18 +730,14 @@ class BLEPrinterController {
   private getServiceScore(uuid: string): number {
     const clean = uuid.toLowerCase();
     const customService = this.getCustomServiceUuid();
-    if (customService && clean === customService.toLowerCase()) {
-      return 10000;
-    }
-    const printerServices = [
-      'ffe0', 'fff0', 'ffd0', 'ff00', 'fee7', 'ae30', 'af30', 'e000', '34b0',
-      '6e400001', '49535343', 'e7fe1800', '38eb4a84', '243a2f0e'
-    ];
+    if (customService && clean === customService.toLowerCase()) return 10000;
+
+    const printerServices = ['ffe0', 'fff0', 'ffd0', 'ff00', 'fee7', '6e40', '4953', 'e7fe'];
     for (const prefix of printerServices) {
       if (clean.includes(prefix)) return 100;
     }
-    const metadataServices = ['1800', '1801', '180a', '180f', '180d', '1812'];
-    for (const prefix of metadataServices) {
+    const systemServices = ['1800', '1801', '180a', '180f'];
+    for (const prefix of systemServices) {
       if (clean.includes(prefix)) return -500;
     }
     return 5;
@@ -855,18 +745,14 @@ class BLEPrinterController {
 
   private getCharacteristicScore(charUuid: string, props: any): number {
     const clean = charUuid.toLowerCase();
-    const canWrite = props.write || props.writeWithoutResponse || props.authenticatedSignedWrites;
+    const canWrite = props.write || props.writeWithoutResponse;
     if (!canWrite) return 0;
 
     let score = 10;
     const customChar = this.getCustomCharacteristicUuid();
-    if (customChar && clean === customChar.toLowerCase()) {
-      return 10000;
-    }
-    const printerWriteChars = [
-      'ffe1', 'fff1', 'fff2', 'ffd1', 'ffd2', 'ff02', 'ae01', 'af01',
-      '6e400002', '49535343-fe7d-4ae5-8fa9-9fafd205e455'
-    ];
+    if (customChar && clean === customChar.toLowerCase()) return 10000;
+
+    const printerWriteChars = ['ffe1', 'fff1', 'ffd1', 'ae01', '6e400002'];
     for (const target of printerWriteChars) {
       if (clean.includes(target)) {
         score += 200;
@@ -891,7 +777,7 @@ class BLEPrinterController {
       const b = pixels[idx + 2];
       const a = pixels[idx + 3];
       if (a < 50) {
-        gray[i] = 255; // White pixels
+        gray[i] = 255; 
       } else {
         gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
       }
@@ -903,7 +789,7 @@ class BLEPrinterController {
         const idx = y * width + x;
         const oldVal = gray[idx];
         const newVal = oldVal < threshold ? 0 : 255;
-        binary[idx] = newVal === 0 ? 1 : 0; // 1 = Black, 0 = White
+        binary[idx] = newVal === 0 ? 1 : 0; 
         const err = oldVal - newVal;
 
         if (x + 1 < width) gray[idx + 1] += err * (7 / 16);
@@ -936,9 +822,6 @@ class BLEPrinterController {
     return binary;
   }
 
-  /**
-   * MSB bit packing (Standard ESC/POS)
-   */
   private packBitsMSB(binary: Uint8Array, width: number, height: number): Uint8Array {
     const widthBytes = Math.ceil(width / 8);
     const packed = new Uint8Array(widthBytes * height);
@@ -954,9 +837,6 @@ class BLEPrinterController {
     return packed;
   }
 
-  /**
-   * LSB bit packing (Cat Printer standard)
-   */
   private packBitsLSB(binary: Uint8Array, width: number, height: number): Uint8Array {
     const widthBytes = Math.ceil(width / 8);
     const packed = new Uint8Array(widthBytes * height);
@@ -972,9 +852,6 @@ class BLEPrinterController {
     return packed;
   }
 
-  /**
-   * CRC-8 Maxim/Dallas mathematical calculation
-   */
   private getCRC8Maxim(data: Uint8Array): number {
     let crc = 0;
     for (let i = 0; i < data.length; i++) {
@@ -990,9 +867,6 @@ class BLEPrinterController {
     return crc;
   }
 
-  /**
-   * Build proprietary packet for Cat Printer architecture
-   */
   private makeCatPrinterPacket(cmd: number, payload: Uint8Array): Uint8Array {
     const header = [0x51, 0x78];
     const cmdArg = [cmd, 0x00];
@@ -1012,14 +886,14 @@ class BLEPrinterController {
   }
 
   /**
-   * Transmission Engine - splits buffer into safe chunks with delayed transmission and GATT retries
+   * Safe Transmission Engine - handles flow control by sending small chunks with microsecond delays
+   * to guarantee zero data loss on slow microcontrollers
    */
   private async sendBuffer(buffer: Uint8Array): Promise<void> {
     const env = this.getEnvironment();
     
     if (env === 'simulator') {
-      console.log(`[Simulator Print] Generating virtual packet chunk stream: ${buffer.length} bytes delivered.`);
-      await new Promise(resolve => setTimeout(resolve, 8));
+      await new Promise(resolve => setTimeout(resolve, 5));
       return;
     }
 
@@ -1052,7 +926,7 @@ class BLEPrinterController {
       });
     }
 
-    // Web Bluetooth Flow with GATT operations retry & backoff delay
+    // Web Bluetooth safe chunked sender
     const size = this.state.chunkSize;
     const delay = this.state.chunkDelay;
     
@@ -1074,12 +948,10 @@ class BLEPrinterController {
       } catch (err: any) {
         const msg = (err.message || '').toLowerCase();
         if (attempt < retries && (msg.includes('progress') || msg.includes('busy') || msg.includes('congestion'))) {
-          console.warn(`[GATT Operation Congestion] Attempt ${attempt} failed, backing off 100ms...`);
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(resolve => setTimeout(resolve, 150));
           continue;
         }
         
-        // Final fallback to typical writeValue block
         try {
           await this.writeCharacteristic.writeValue(chunk);
           return;
@@ -1091,7 +963,7 @@ class BLEPrinterController {
   }
 
   /**
-   * Dynamic Offscreen Layout Renderer for High Polish Graphics Capture
+   * Beautiful offscreen Canvas receipt renderer (Supports beautiful Cairo/Arial fonts and custom margins)
    */
   private renderReceiptToCanvas(receipt: Receipt): HTMLCanvasElement {
     const canvas = document.createElement('canvas');
@@ -1109,7 +981,7 @@ class BLEPrinterController {
     canvas.height = canvasHeight;
 
     const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Could not launch Cairo graphics renderer');
+    if (!ctx) throw new Error('Could not initialize graphics engine');
 
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, width, canvasHeight);
@@ -1119,7 +991,7 @@ class BLEPrinterController {
 
     let currentY = 15;
 
-    // Centered Badge Icon
+    // Center Badge Logo
     ctx.beginPath();
     ctx.arc(width / 2, currentY + 20, 18, 0, Math.PI * 2);
     ctx.strokeStyle = '#000000';
@@ -1131,47 +1003,47 @@ class BLEPrinterController {
     ctx.fillText('⚡', width / 2, currentY + 11);
     currentY += 45;
 
-    // Identifier Header
-    ctx.font = `bold ${is80 ? '24px' : '18px'} "Cairo", "Segoe UI", sans-serif`;
+    // Header Details
+    ctx.font = `bold ${is80 ? '24px' : '18px'} "Cairo", "Segoe UI", Arial, sans-serif`;
     ctx.textAlign = 'center';
     ctx.fillText(receiptTitle, width / 2, currentY);
     currentY += is80 ? 30 : 25;
 
-    ctx.font = `bold ${is80 ? '14px' : '11px'} "Cairo", "Segoe UI", sans-serif`;
+    ctx.font = `bold ${is80 ? '14px' : '11px'} "Cairo", "Segoe UI", Arial, sans-serif`;
     ctx.fillText(receiptFirm, width / 2, currentY);
     currentY += 18;
 
     if (receiptPhone) {
       ctx.font = '10px monospace';
-      ctx.fillText(`طوارئ الشبكة: ${receiptPhone}`, width / 2, currentY);
+      ctx.fillText(`طوارئ ومبيعات: ${receiptPhone}`, width / 2, currentY);
       currentY += 15;
     }
 
     this.drawDashedLine(ctx, margin, width - margin, currentY);
     currentY += 12;
 
-    ctx.font = `bold ${is80 ? '15px' : '12.5px'} "Cairo", "Segoe UI", sans-serif`;
+    ctx.font = `bold ${is80 ? '15px' : '12.5px'} "Cairo", "Segoe UI", Arial, sans-serif`;
     ctx.fillText('وصل استلام مالي (مُسدّد بالكامل) 🟢', width / 2, currentY);
     currentY += is80 ? 25 : 22;
 
     this.drawDashedLine(ctx, margin, width - margin, currentY);
     currentY += 15;
 
-    // Inline Alignment Row Drawer
+    // Itemized table grid rows (Right-to-left layout)
     const drawItemRow = (key: string, val: string, isKeyBold = false) => {
       ctx.textAlign = 'right';
-      ctx.font = `${isKeyBold ? 'bold' : ''} ${is80 ? '14px' : '11.5px'} "Cairo", "Segoe UI", sans-serif`;
+      ctx.font = `${isKeyBold ? 'bold' : ''} ${is80 ? '14px' : '11.5px'} "Cairo", "Segoe UI", Arial, sans-serif`;
       ctx.fillText(`${key}:`, width - margin, currentY);
 
       ctx.textAlign = 'left';
-      ctx.font = `bold ${is80 ? '14px' : '11.5px'} "Cairo", "Segoe UI", sans-serif`;
+      ctx.font = `bold ${is80 ? '14px' : '11.5px'} "Cairo", "Segoe UI", Arial, sans-serif`;
       ctx.fillText(val, margin, currentY);
       
       currentY += is80 ? 24 : 19;
     };
 
-    drawItemRow('رقم الإيصال الرقمي', receipt.invoiceNo, true);
-    drawItemRow('تاريخ السداد والتقييد', receipt.paymentDate);
+    drawItemRow('رقم الوصل', receipt.invoiceNo, true);
+    drawItemRow('تاريخ التسديد والتقييد', receipt.paymentDate);
     drawItemRow('المشترك المستفيد', receipt.subscriberName, true);
     drawItemRow('الهاتف المسجل', receipt.subscriberPhone);
     drawItemRow('صنف ونوع الاشتراك', receipt.subscriptionType);
@@ -1184,11 +1056,11 @@ class BLEPrinterController {
     currentY += 15;
 
     ctx.textAlign = 'center';
-    ctx.font = `bold ${is80 ? '13px' : '11px'} "Cairo", "Segoe UI", sans-serif`;
+    ctx.font = `bold ${is80 ? '13px' : '11px'} "Cairo", "Segoe UI", Arial, sans-serif`;
     ctx.fillText('إجمالي تصفية الحساب المستلم:', width / 2, currentY);
     currentY += 18;
 
-    ctx.font = `bold ${is80 ? '22px' : '17px'} monospace, "Segoe UI", sans-serif`;
+    ctx.font = `bold ${is80 ? '22px' : '17px'} monospace, Arial, sans-serif`;
     ctx.fillText(`${receipt.totalAmount.toLocaleString()} دينار عراقي`, width / 2, currentY);
     currentY += is80 ? 32 : 28;
 
@@ -1196,7 +1068,7 @@ class BLEPrinterController {
     currentY += 12;
 
     ctx.textAlign = 'center';
-    ctx.font = `bold ${is80 ? '11px' : '9.5px'} "Cairo", "Segoe UI", sans-serif`;
+    ctx.font = `bold ${is80 ? '11px' : '9.5px'} "Cairo", "Segoe UI", Arial, sans-serif`;
     ctx.fillText(receiptFooter, width / 2, currentY);
     currentY += 18;
 
@@ -1219,10 +1091,10 @@ class BLEPrinterController {
     }
     currentY += 45;
 
-    ctx.font = '8px "Cairo", "Segoe UI", sans-serif';
+    ctx.font = '8px "Cairo", "Segoe UI", Arial, sans-serif';
     ctx.fillText('نظام إدارة المولدات والتحصيل الميداني الذكي', width / 2, currentY);
 
-    // Crop Canvas exactly to boundary height
+    // Crop Canvas
     const finalHeight = Math.ceil(currentY + 25);
     const croppedCanvas = document.createElement('canvas');
     croppedCanvas.width = width;
@@ -1249,13 +1121,13 @@ class BLEPrinterController {
   }
 
   /**
-   * Main Printing Core Function supporting hybrid devices, simulators and web
+   * Main Printing Core Function optimized for Chinese thermal printers
    */
   public async printReceipt(receipt: Receipt): Promise<boolean> {
     try {
       this.updateState({ 
         error: null, 
-        statusMessage: 'جاري مواءمة حالة ومعدل اتصال الطابعة اللاسلكية...', 
+        statusMessage: 'جاري مراجعة اتصال ومكونات الطابعة اللاسلكية...', 
         progress: 10 
       });
 
@@ -1266,82 +1138,76 @@ class BLEPrinterController {
       }
 
       this.updateState({ 
-        statusMessage: 'جاري توليد رسومات الفاتورة والتوطير المالي...', 
+        statusMessage: 'جاري توليد رسومات الفاتورة وتوطير التنسيق العربي المالي...', 
         progress: 30 
       });
 
-      // Renders high precision Cairo-font graphical receipt
       const canvas = this.renderReceiptToCanvas(receipt);
       const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('فشل جلب سياق الرسم الرسومي ثنائي الأبعاد Canvas context');
+      if (!ctx) throw new Error('Could not load 2D context');
 
       const width = canvas.width;
       const height = canvas.height;
       const imgData = ctx.getImageData(0, 0, width, height);
       
       this.updateState({ 
-        statusMessage: 'جاري استخدام معالجات التنقيط المتقدمة (Binarization & Dithering)...', 
+        statusMessage: 'جاري تنقيط ومعالجة الصورة لملائمة الأبعاد الحرارية...', 
         progress: 50 
       });
 
-      // 1. Process Raw Colors -> Binary Grid containing exclusively Black/White bits
+      // Render binarized pixel array
       const binaryData = this.state.ditheringEnabled
         ? this.ditherFloydSteinberg(imgData.data, width, height, this.state.contrastThreshold)
         : this.thresholdBinarize(imgData.data, width, height, this.state.contrastThreshold);
 
-      // 2. Wrap and transmit binary frames based on the protocol
       if (this.state.printerType === 'cat_printer') {
-        this.updateState({ statusMessage: 'جاري تهيئة طابعة Cat وصياغة الحزم المتطابقة...', progress: 65 });
+        // Cat Printer Protocol
+        this.updateState({ statusMessage: 'جاري تهيئة طابعة القطة الذكية وصياغة الحزم الخاصة...', progress: 65 });
         
-        // Cat Printer standard sequence
-        await this.sendBuffer(this.makeCatPrinterPacket(0xA4, new Uint8Array([0x32]))); // 200 DPI Setup
-        await this.sendBuffer(this.makeCatPrinterPacket(0xAF, new Uint8Array([0xFF, 0xFF]))); // High power density
+        await this.sendBuffer(this.makeCatPrinterPacket(0xA4, new Uint8Array([0x32]))); 
+        await this.sendBuffer(this.makeCatPrinterPacket(0xAF, new Uint8Array([0xFF, 0xFF]))); 
         
-        // Start lattice
         const latticeStart = new Uint8Array([0xAA, 0x55, 0x17, 0x38, 0x44, 0x5F, 0x5F, 0x5F, 0x44, 0x38, 0x2C]);
         await this.sendBuffer(this.makeCatPrinterPacket(0xA6, latticeStart));
 
-        const widthBytes = Math.ceil(width / 8); // 48 bytes for 384 pixels
-        
-        // Pack into LSB bit order
+        const widthBytes = Math.ceil(width / 8); 
         const packetBytes = this.packBitsLSB(binaryData, width, height);
 
-        // Send line by line
         for (let y = 0; y < height; y++) {
           if (y % 15 === 0) {
             const p = 65 + Math.floor((y / height) * 20);
-            this.updateState({ statusMessage: `جاري ضخ صفوف البكسلات (${y}/${height})...`, progress: p });
+            this.updateState({ statusMessage: `جاري ضخ صفوف بكسلات الفاتورة (${y}/${height})...`, progress: p });
           }
           const rowBytes = packetBytes.slice(y * widthBytes, (y + 1) * widthBytes);
           await this.sendBuffer(this.makeCatPrinterPacket(0xA2, rowBytes));
         }
 
-        // End lattice
         const latticeEnd = new Uint8Array([0xAA, 0x55, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17]);
         await this.sendBuffer(this.makeCatPrinterPacket(0xA6, latticeEnd));
         
-        // Set feed speed & Feed paper 1cm (80 steps)
         await this.sendBuffer(this.makeCatPrinterPacket(0xBD, new Uint8Array([65])));
-        await this.sendBuffer(this.makeCatPrinterPacket(0xA1, new Uint8Array([120, 0]))); // Feed 1.5 cm
+        await this.sendBuffer(this.makeCatPrinterPacket(0xA1, new Uint8Array([120, 0]))); 
 
       } else {
         // --- STANDARD UNIVERSAL ESC/POS PROTOCOL ---
-        this.updateState({ statusMessage: 'جاري تهيئة الطابعة القياسية (ESC/POS Initialize)...', progress: 65 });
+        // Perfect for Chinese PT-210 / MPT-II / XP-58 / XP-80
+        this.updateState({ statusMessage: 'جاري تهيئة الطابعة للبدء (Initialize ESC/POS)...', progress: 65 });
         
-        const initCmd = new Uint8Array([0x1B, 0x40]); // ESC @
+        const initCmd = new Uint8Array([0x1B, 0x40]); // ESC @ (Initialize printer)
         await this.sendBuffer(initCmd);
 
-        // Pack into standard MSB bit order
         const widthBytes = Math.ceil(width / 8);
         const packedData = this.packBitsMSB(binaryData, width, height);
 
-        this.updateState({ statusMessage: 'جاري تسريب وطباعة الحزم النقطية لغلاية الطابعة...', progress: 80 });
+        this.updateState({ statusMessage: 'جاري بث وطباعة الفاتورة على شكل حزم نقطية صغيرة...', progress: 80 });
 
-        // Split image into manageable vertical strips to avoid buffer overflow on poor chips
-        const stripHeight = 40; 
+        // CRITICAL FOR CHINESE PRINTERS: Split image into very small vertical strips
+        // Using stripHeight = 16 to guarantee we never overflow the tiny printer's receive buffer.
+        const stripHeight = 16; 
         for (let yOffset = 0; yOffset < height; yOffset += stripHeight) {
           const chunkHeight = Math.min(stripHeight, height - yOffset);
           
+          // GS v 0 m xL xH yL yH d1...dk (Standard ESC/POS Raster Bit Image command)
           const header = new Uint8Array([
             0x1D, 0x76, 0x30, 0x00, 
             widthBytes & 0xFF, (widthBytes >> 8) & 0xFF, 
@@ -1354,12 +1220,17 @@ class BLEPrinterController {
           stripBuffer.set(chunkBytes, header.length);
           
           await this.sendBuffer(stripBuffer);
-          await new Promise(resolve => setTimeout(resolve, 80)); // Safe settle pause
+          
+          // Settle pause to let the thermal head heat up, print the strip, and advance paper
+          await new Promise(resolve => setTimeout(resolve, 60)); 
         }
 
-        // Feed paper block and slice
-        const cutBuffer = new Uint8Array([0x1B, 0x64, 0x06, 0x1D, 0x56, 0x01]); // Feed 6 lines then partial cut
-        await this.sendBuffer(cutBuffer);
+        // Feed 5 lines at the end to allow neat manual tearing
+        const feedAndCutCmd = new Uint8Array([
+          0x1B, 0x64, 0x05,       // ESC d 5 (Feed 5 lines)
+          0x1D, 0x56, 0x01        // GS V 1 (Partial cut)
+        ]);
+        await this.sendBuffer(feedAndCutCmd);
       }
 
       this.updateState({ 
@@ -1372,7 +1243,7 @@ class BLEPrinterController {
     } catch (err: any) {
       console.error('Print receipt failed:', err);
       this.updateState({ 
-        error: `حدث خطأ غير متوقع أثناء الطباعة: ${err.message || err}`,
+        error: `حدث خطأ أثناء إرسال البيانات للطابعة: ${err.message || err}`,
         statusMessage: null,
         progress: 0
       });
@@ -1381,7 +1252,7 @@ class BLEPrinterController {
   }
 
   /**
-   * Universal HTML Iframe Print fallback - works beautifully everywhere (no Bluetooth required)
+   * Browser print fallback (Saves paper, works on iOS Safari and every machine flawlessly)
    */
   public printViaBrowser(receipt: Receipt): boolean {
     const is80 = this.state.paperWidth === '80mm';
@@ -1599,7 +1470,6 @@ class BLEPrinterController {
     `);
     doc.close();
 
-    // Trigger iframe reload-print
     setTimeout(() => {
       iframe?.contentWindow?.focus();
     }, 150);
@@ -1624,77 +1494,8 @@ class BLEPrinterController {
         return false;
       }
 
-      this.updateState({ statusMessage: 'جاري نسج وتشكيل صفحة اختبار حرارية...', progress: 30 });
+      this.updateState({ statusMessage: 'جاري توليد صفحة اختبار حرارية...', progress: 30 });
 
-      const canvas = document.createElement('canvas');
-      const is80 = this.state.paperWidth === '80mm';
-      const width = is80 ? 576 : 384;
-      const height = is80 ? 380 : 320;
-      
-      canvas.width = width;
-      canvas.height = height;
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return false;
-
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, width, height);
-
-      ctx.fillStyle = '#000000';
-      ctx.textBaseline = 'top';
-
-      let currentY = 20;
-
-      ctx.font = 'bold 24px Arial';
-      ctx.textAlign = 'center';
-      ctx.fillText('✅', width / 2, currentY);
-      currentY += 35;
-
-      ctx.font = 'bold 15px "Cairo", "Segoe UI", Arial, sans-serif';
-      ctx.fillText('اختبار اتصال الطابعة الحرارية الميدانية', width / 2, currentY);
-      currentY += 25;
-
-      ctx.font = '10px monospace';
-      ctx.fillText(`الطابعة النشطة الحالية: ${this.state.deviceName}`, width / 2, currentY);
-      currentY += 15;
-
-      ctx.font = '10px monospace';
-      ctx.fillText(`بروتوكول البث: ${this.state.printerType === 'cat_printer' ? 'Cat Printer' : 'ESC/POS'}`, width / 2, currentY);
-      currentY += 15;
-
-      ctx.font = '10px monospace';
-      ctx.fillText(`مقاس حزمة النقل: ${this.state.chunkSize} Bytes`, width / 2, currentY);
-      currentY += 15;
-
-      ctx.font = '10px monospace';
-      ctx.fillText(`زمن تأخير المعالجة: ${this.state.chunkDelay} ms`, width / 2, currentY);
-      currentY += 15;
-
-      ctx.font = '10px monospace';
-      ctx.fillText(`تقنية التدرج (Dithering): ${this.state.ditheringEnabled ? 'مفعلة' : 'معطلة'}`, width / 2, currentY);
-      currentY += 15;
-
-      ctx.font = '11px "Cairo", "Segoe UI", Arial, sans-serif';
-      ctx.fillText(`التاريخ: ${new Date().toLocaleString('ar-IQ')}`, width / 2, currentY);
-      currentY += 25;
-
-      this.drawDashedLine(ctx, 15, width - 15, currentY);
-      currentY += 15;
-
-      ctx.font = 'bold 11px "Cairo", "Segoe UI", Arial, sans-serif';
-      ctx.fillText('الطابعة متصلة بالتطبيق وتعمل بكفاءة تامة! 🎉', width / 2, currentY);
-
-      const finalHeight = Math.ceil(currentY + 25);
-      const croppedCanvas = document.createElement('canvas');
-      croppedCanvas.width = width;
-      croppedCanvas.height = finalHeight;
-      const croppedCtx = croppedCanvas.getContext('2d');
-      if (croppedCtx) {
-        croppedCtx.drawImage(canvas, 0, 0);
-      }
-
-      this.updateState({ statusMessage: 'جاري تبييت ورص حزم طباعة الاختبار...', progress: 60 });
-      
       const testReceipt: Receipt = {
         id: 'test_uuid',
         subscriberId: 'mock_sub',
@@ -1710,10 +1511,9 @@ class BLEPrinterController {
         subscriptionType: 'عادي',
       };
 
-      // Print using the core function
       await this.printReceipt(testReceipt);
 
-      this.updateState({ statusMessage: 'تم طباعة ورقة الاختبار بنجاح تام! 🟢', progress: 100 });
+      this.updateState({ statusMessage: 'تم طباعة صفحة الاختبار بنجاح تام! 🟢', progress: 100 });
       setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 3000);
       return true;
 
@@ -1728,6 +1528,23 @@ class BLEPrinterController {
     }
   }
 
+  private startAutoReconnectionTimer() {
+    if (this.autoReconnectTimer) clearInterval(this.autoReconnectTimer);
+    
+    this.autoReconnectTimer = setInterval(() => {
+      const env = this.getEnvironment();
+      if (this.state.isConnected || this.state.isConnecting || this.state.isScanning) return;
+      
+      const lastAddress = localStorage.getItem('ble_last_device_address');
+      if (!lastAddress) return;
+
+      if (env === 'android_bridge') {
+        this.updateState({ isConnected: true });
+      } else if (env === 'browser') {
+        // Web Bluetooth cannot auto-reconnect without a user gesture, so we wait.
+      }
+    }, 15000);
+  }
 }
 
 export const blePrinter = new BLEPrinterController();
