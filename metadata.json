@@ -1,0 +1,6 @@
+{
+  "name": "نظام مولدتي",
+  "description": "تطبيق إدارة المولدات الأهلية: تتبع المشتركين والاشتراكات، إدارة المصروفات، طباعة الوصولات، ونظام محاسبة متكامل مع وضعية العمل بدون اتصال بالإنترنت.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

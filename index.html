@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>نظام مولدتي - شركة الحلول المتميزة</title>
+    
+    <!-- Web App configurations -->
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <meta name="theme-color" content="#0f172a" />
+  </head>
+  <body class="bg-slate-50 antialiased selection:bg-blue-100 select-none">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    
+    <!-- Active Service Worker Unregistration to clean up old PWA state -->
+    <script>
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(function(registrations) {
+          for(let registration of registrations) {
+            registration.unregister().then(() => {
+              console.log('Successfully unregistered old PWA Service Worker');
+            });
+          }
+        });
+        
+        // Also clear any old caches to force fresh load of Web App assets
+        if ('caches' in window) {
+          caches.keys().then(function(names) {
+            for (let name of names) {
+              caches.delete(name);
+            }
+          });
+        }
+      }
+    </script>
+  </body>
+</html>
+
