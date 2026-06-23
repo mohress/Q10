@@ -107,6 +107,25 @@ export default function Settings({
     triggerToast('🔌 تم فصل الطابعة الحرارية الميدانية بأمان', 'info');
   };
 
+  const handleStartScan = async () => {
+    await blePrinter.startScanning();
+    triggerToast('🔍 جاري البحث عن الأجهزة القريبة والمقترنة...', 'info');
+  };
+
+  const handleStopScan = () => {
+    blePrinter.stopScanning();
+    triggerToast('🛑 تم إيقاف عملية البحث عن الأجهزة', 'info');
+  };
+
+  const handleConnectSpecific = async (device: any) => {
+    const success = await blePrinter.connectToSpecificDevice(device);
+    if (success) {
+      triggerToast(`🔌 تم توصيل الطابعة: ${device.name} بنجاح!`, 'success');
+    } else {
+      triggerToast(blePrinter.state.error || 'فشلت عملية التوصيل بالطابعة المحددة', 'warning');
+    }
+  };
+
   const handlePrintTest = async () => {
     const success = await blePrinter.printTestPage();
     if (success) {
@@ -607,8 +626,8 @@ export default function Settings({
           </div>
 
           {/* Connection status display */}
-          <div className="p-3.5 rounded-2xl border border-slate-100 bg-slate-50 flex items-center justify-between text-xs">
-            <div className="flex items-center gap-2.5 text-right">
+          <div className="p-3.5 rounded-2xl border border-slate-100 bg-slate-50 flex flex-col sm:flex-row gap-3 items-center justify-between text-xs">
+            <div className="flex items-center gap-2.5 text-right w-full sm:w-auto">
               <div className={`w-3.5 h-3.5 rounded-full flex items-center justify-center shrink-0 ${printerState.isConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`}>
                 <div className={`w-1.5 h-1.5 rounded-full bg-white`}></div>
               </div>
@@ -619,30 +638,107 @@ export default function Settings({
                     ? `متصل بالبلوتوث: ${printerState.deviceName}` 
                     : printerState.isConnecting 
                     ? 'جاري الاقتران وتهيئة الخدمات...' 
+                    : printerState.isScanning
+                    ? 'جاري البحث عن أجهزة البلوتوث...'
                     : 'الطابعة اللاسلكية غير متصلة حالياً'}
                 </p>
               </div>
             </div>
 
-            {printerState.isConnected ? (
-              <button
-                onClick={handleDisconnectPrinter}
-                className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold text-[10px] rounded-xl border border-rose-100 active:scale-95 transition-transform cursor-pointer shrink-0"
-              >
-                قطع الاتصال
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={handleConnectPrinter}
-                disabled={printerState.isConnecting}
-                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-extrabold text-[10.5px] rounded-xl flex items-center gap-1.5 active:scale-95 transition-transform cursor-pointer shadow-3xs shrink-0"
-              >
-                <Bluetooth className="w-3.5 h-3.5" />
-                <span>{printerState.isConnecting ? 'انتظار...' : 'اقتران لاسلكي'}</span>
-              </button>
-            )}
+            <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+              {printerState.isConnected ? (
+                <button
+                  onClick={handleDisconnectPrinter}
+                  className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold text-[10px] rounded-xl border border-rose-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                >
+                  قطع الاتصال
+                </button>
+              ) : (
+                <>
+                  {printerState.isScanning ? (
+                    <button
+                      type="button"
+                      onClick={handleStopScan}
+                      className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-extrabold text-[10.5px] rounded-xl flex items-center gap-1.5 active:scale-95 transition-transform cursor-pointer shadow-3xs shrink-0"
+                    >
+                      <span className="w-1.5 h-1.5 bg-white rounded-full animate-ping"></span>
+                      <span>إيقاف البحث 🛑</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={handleStartScan}
+                      disabled={printerState.isConnecting}
+                      className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-extrabold text-[10.5px] rounded-xl flex items-center gap-1.5 active:scale-95 transition-transform cursor-pointer shadow-3xs shrink-0"
+                    >
+                      <Bluetooth className="w-3.5 h-3.5" />
+                      <span>{printerState.isConnecting ? 'انتظار...' : 'بحث واقتران يدوي'}</span>
+                    </button>
+                  )}
+                  
+                  {!printerState.isScanning && (
+                    <button
+                      type="button"
+                      onClick={handleConnectPrinter}
+                      disabled={printerState.isConnecting}
+                      className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 disabled:bg-slate-100 text-slate-800 font-bold text-[10.5px] rounded-xl flex items-center gap-1.5 active:scale-95 transition-transform cursor-pointer shrink-0"
+                    >
+                      اقتران الويب التلقائي
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
           </div>
+
+          {/* Discovered devices selection list */}
+          {(printerState.isScanning || (printerState.discoveredDevices && printerState.discoveredDevices.length > 0)) && (
+            <div className="p-4 rounded-2xl border border-indigo-100 bg-indigo-50/20 text-right space-y-3 animate-fade-in">
+              <div className="flex justify-between items-center pb-2 border-b border-indigo-150">
+                <span className="text-[11px] font-black text-indigo-900 flex items-center gap-1.5">
+                  <span className="relative flex h-2 w-2">
+                    {printerState.isScanning && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>}
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                  </span>
+                  أجهزة البلوتوث المكتشفة والمقترنة ({printerState.discoveredDevices.length})
+                </span>
+                {printerState.isScanning && (
+                  <span className="text-[10px] font-mono text-indigo-600 font-bold animate-pulse">جاري البحث...</span>
+                )}
+              </div>
+
+              {printerState.discoveredDevices.length === 0 ? (
+                <div className="py-4 text-center text-slate-400 font-semibold text-[11px]">
+                  {printerState.isScanning ? 'جاري البحث ورصد الإشارات قريباً...' : 'لم يتم العثور على أجهزة بلوتوث بعد.'}
+                </div>
+              ) : (
+                <div className="max-h-56 overflow-y-auto space-y-2 pr-1">
+                  {printerState.discoveredDevices.map((device: any) => (
+                    <div 
+                      key={device.id}
+                      className="p-2.5 rounded-xl border border-slate-200 bg-white flex items-center justify-between transition-all hover:border-indigo-300 hover:bg-indigo-50/10"
+                    >
+                      <div className="flex items-center gap-2 text-right">
+                        <Bluetooth className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                        <div>
+                          <p className="font-extrabold text-[11px] text-slate-800">{device.name}</p>
+                          <p className="font-mono text-[9px] text-slate-400 mt-0.5">{device.id}</p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleConnectSpecific(device)}
+                        disabled={printerState.isConnecting}
+                        className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-black text-[10px] rounded-lg cursor-pointer transition-colors shrink-0"
+                      >
+                        توصيل واقتران
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Connection progress loader */}
           {printerState.isConnecting && printerState.statusMessage && (

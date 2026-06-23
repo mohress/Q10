@@ -6,6 +6,14 @@
 import html2canvas from 'html2canvas';
 import { Receipt } from '../types';
 
+export interface DiscoveredDevice {
+  id: string;
+  name: string;
+  type: 'ble' | 'classic' | 'simulator';
+  address?: string;
+  rssi?: number;
+}
+
 // Declare standard Bluetooth state structure
 export interface BLEPrinterState {
   isConnected: boolean;
@@ -22,6 +30,8 @@ export interface BLEPrinterState {
   statusMessage?: string | null;
   progress?: number;
   isSimulator?: boolean;     // Enable Virtual Simulator Mode for diagnostics without physical printer
+  discoveredDevices: DiscoveredDevice[];
+  isScanning: boolean;
 }
 
 class BLEPrinterController {
@@ -45,6 +55,8 @@ class BLEPrinterController {
     statusMessage: null,
     progress: 0,
     isSimulator: localStorage.getItem('ble_is_simulator') === 'true',
+    discoveredDevices: [],
+    isScanning: false,
   };
 
   constructor() {
@@ -136,6 +148,216 @@ class BLEPrinterController {
     } else if (this.state.deviceName?.includes('Simulator')) {
       this.disconnect();
     }
+  }
+
+  public async startScanning(): Promise<void> {
+    const env = this.getEnvironment();
+    const win = window as any;
+
+    this.updateState({
+      isScanning: true,
+      discoveredDevices: [],
+      error: null,
+      statusMessage: 'جاري البحث عن أجهزة البلوتوث المتاحة...',
+      progress: 10
+    });
+
+    if (env === 'simulator' || this.state.isSimulator) {
+      // Simulator Mode: generate fake devices
+      await new Promise(resolve => setTimeout(resolve, 800));
+      const simulatedDevices: DiscoveredDevice[] = [
+        { id: 'sim_1', name: 'الطابعة الافتراضية المحمولة MPT-II', type: 'simulator' },
+        { id: 'sim_2', name: 'طابعة الإيصالات الحرارية XP-58', type: 'simulator' },
+        { id: 'sim_3', name: 'طابعة الفواتير المكتبية XP-80', type: 'simulator' },
+        { id: 'sim_cat', name: 'طابعة القطة الذكية Cat Printer', type: 'simulator' }
+      ];
+      this.updateState({
+        discoveredDevices: simulatedDevices,
+        isScanning: false,
+        statusMessage: 'اكتمل البحث المبرمج. يرجى اختيار طابعتك من القائمة أدناه.',
+        progress: 100
+      });
+      return;
+    }
+
+    if (env === 'android_cordova') {
+      try {
+        await this.requestAndroidPermissions().catch((e) => console.log('Permission request failed/ignored', e));
+
+        const deviceList: DiscoveredDevice[] = [];
+
+        // 1. Check Classic Bluetooth Paired Devices
+        if (win.bluetoothSerial) {
+          win.bluetoothSerial.list((pairedDevices: any[]) => {
+            pairedDevices.forEach((d: any) => {
+              deviceList.push({
+                id: d.address || d.id,
+                name: `${d.name || 'جهاز مجهول'} (كلاسيكي مقترن)`,
+                type: 'classic',
+                address: d.address || d.id
+              });
+            });
+            this.updateState({ discoveredDevices: [...deviceList] });
+          }, (err: any) => {
+            console.log('Error listing classic devices', err);
+          });
+
+          // Start scanning for unpaired classic devices
+          win.bluetoothSerial.discoverUnpaired((unpairedDevices: any[]) => {
+            unpairedDevices.forEach((d: any) => {
+              if (!deviceList.some(existing => existing.id === d.address)) {
+                deviceList.push({
+                  id: d.address || d.id,
+                  name: `${d.name || 'جهاز مجهول'} (كلاسيكي)`,
+                  type: 'classic',
+                  address: d.address || d.id
+                });
+              }
+            });
+            this.updateState({ discoveredDevices: [...deviceList] });
+          }, (err: any) => {
+            console.log('Error discovering unpaired classic devices', err);
+          });
+        }
+
+        // 2. Check BLE Devices
+        if (win.ble) {
+          win.ble.startScan([], (device: any) => {
+            const name = device.name || device.id || 'جهاز BLE غير مسمى';
+            if (!deviceList.some(existing => existing.id === device.id)) {
+              deviceList.push({
+                id: device.id,
+                name: `${name} (طاقة منخفضة BLE)`,
+                type: 'ble',
+                address: device.id,
+                rssi: device.rssi
+              });
+              this.updateState({ discoveredDevices: [...deviceList] });
+            }
+          }, (err: any) => {
+            console.error('Error in BLE scan', err);
+          });
+        }
+
+        // Auto-stop BLE scan after 15 seconds
+        setTimeout(() => {
+          this.stopScanning();
+        }, 15000);
+
+      } catch (err: any) {
+        this.updateState({
+          isScanning: false,
+          error: `فشل تشغيل مسح البلوتوث: ${err.message || err}`
+        });
+      }
+    } else {
+      // In web browser (not simulator)
+      this.updateState({
+        isScanning: false,
+        statusMessage: 'في متصفح الويب، سيظهر لك مربع حوار مدمج من المتصفح مباشرة لاختيار الطابعة.',
+        progress: 100
+      });
+      // Automatically run standard connect to open browser native picker
+      await this.connect();
+    }
+  }
+
+  public stopScanning(): void {
+    const env = this.getEnvironment();
+    const win = window as any;
+    
+    if (env === 'android_cordova' && win.ble) {
+      try {
+        win.ble.stopScan();
+      } catch (e) {
+        console.log('Failed to stop scan', e);
+      }
+    }
+    this.updateState({
+      isScanning: false,
+      progress: 0,
+      statusMessage: this.state.discoveredDevices.length > 0 
+        ? `تم العثور على ${this.state.discoveredDevices.length} أجهزة. يرجى الاختيار.`
+        : 'اكتمل فحص البلوتوث.'
+    });
+  }
+
+  public async connectToSpecificDevice(device: DiscoveredDevice): Promise<boolean> {
+    const env = this.getEnvironment();
+    const win = window as any;
+
+    this.updateState({
+      isConnecting: true,
+      error: null,
+      statusMessage: `جاري بدء التوصيل والاقتران بـ: ${device.name}...`,
+      progress: 10
+    });
+
+    this.stopScanning();
+
+    if (device.type === 'simulator') {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      this.updateState({
+        isConnected: true,
+        isConnecting: false,
+        deviceName: device.name,
+        statusMessage: `تم التوصيل بالمحاكي "${device.name}" بنجاح! 🟢`,
+        progress: 100
+      });
+      setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
+      return true;
+    }
+
+    if (env === 'android_cordova') {
+      try {
+        if (device.type === 'ble' && win.ble) {
+          return new Promise<boolean>((resolve) => {
+            this.updateState({ statusMessage: 'جاري إنشاء قناة اتصال آمنة BLE...', progress: 40 });
+            win.ble.connect(device.id, () => {
+              localStorage.setItem('ble_last_device_address', device.id);
+              localStorage.setItem('ble_last_device_name', device.name);
+              this.updateState({
+                isConnected: true,
+                isConnecting: false,
+                deviceName: device.name,
+                statusMessage: 'تم الاقتران اللاسلكي بالأندرويد بنجاح! ⚡',
+                progress: 100
+              });
+              setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
+              resolve(true);
+            }, (err: any) => {
+              this.updateState({ isConnected: false, isConnecting: false, error: `فشل ربط جهاز BLE: ${JSON.stringify(err)}` });
+              resolve(false);
+            });
+          });
+        } else if (win.bluetoothSerial) {
+          return new Promise<boolean>((resolve) => {
+            this.updateState({ statusMessage: 'جاري فتح منفذ القناة التسلسلية SPP...', progress: 50 });
+            win.bluetoothSerial.connect(device.id, () => {
+              localStorage.setItem('ble_last_device_address', device.id);
+              localStorage.setItem('ble_last_device_name', device.name);
+              this.updateState({
+                isConnected: true,
+                isConnecting: false,
+                deviceName: device.name,
+                statusMessage: 'تم التوصيل والربط الكلاسيكي بنجاح! 🎉',
+                progress: 100
+              });
+              setTimeout(() => this.updateState({ statusMessage: null, progress: 0 }), 2500);
+              resolve(true);
+            }, (err: any) => {
+              this.updateState({ isConnected: false, isConnecting: false, error: `فشل الاقتران بالقناة التسلسلية: ${err}` });
+              resolve(false);
+            });
+          });
+        }
+      } catch (err: any) {
+        this.updateState({ isConnected: false, isConnecting: false, error: `حدث خطأ أثناء محاولة التوصيل: ${err.message || err}` });
+        return false;
+      }
+    }
+
+    return false;
   }
 
   /**
