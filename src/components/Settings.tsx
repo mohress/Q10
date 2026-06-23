@@ -69,6 +69,12 @@ export default function Settings({
   const [customServiceUuid, setCustomServiceUuidState] = useState(blePrinter.getCustomServiceUuid() || '');
   const [customCharUuid, setCustomCharUuidState] = useState(blePrinter.getCustomCharacteristicUuid() || '');
 
+  // Custom transmission and rendering states
+  const [chunkSize, setChunkSizeState] = useState(blePrinter.state.chunkSize);
+  const [chunkDelay, setChunkDelayState] = useState(blePrinter.state.chunkDelay);
+  const [contrastThreshold, setContrastThresholdState] = useState(blePrinter.state.contrastThreshold);
+  const [ditheringEnabled, setDitheringEnabledState] = useState(blePrinter.state.ditheringEnabled);
+
   const handleSaveCustomUuids = () => {
     blePrinter.setCustomServiceUuid(customServiceUuid);
     blePrinter.setCustomCharacteristicUuid(customCharUuid);
@@ -78,6 +84,11 @@ export default function Settings({
   useEffect(() => {
     const unsubscribe = blePrinter.subscribe((state) => {
       setPrinterState(state);
+      // Synchronize state values locally
+      setChunkSizeState(state.chunkSize);
+      setChunkDelayState(state.chunkDelay);
+      setContrastThresholdState(state.contrastThreshold);
+      setDitheringEnabledState(state.ditheringEnabled);
     });
     return unsubscribe;
   }, []);
@@ -530,8 +541,68 @@ export default function Settings({
               <Bluetooth className="w-4.5 h-4.5" />
             </div>
             <div>
-              <h4 className="text-xs sm:text-sm font-black text-slate-800">إعدادات الطابعة الحرارية المحمولة (BLE Bluetooth)</h4>
-              <p className="text-[10px] text-slate-500 font-semibold mt-0.5">ربط النظام بطابعة فواتير حرارية ميدانية لاسلكية لطباعة الدفعات فورياً للمشتركين.</p>
+              <h4 className="text-xs sm:text-sm font-black text-slate-800">إعدادات الطابعة الحرارية ونظام الوصولات الميداني</h4>
+              <p className="text-[10px] text-slate-500 font-semibold mt-0.5">تهيئة البرنامج للعمل مع طابعات الفواتير المحمولة واللاسلكية لطباعة الدفعات فورياً للمشتركين.</p>
+            </div>
+          </div>
+
+          {/* Default Print Action Configuration */}
+          <div className="p-4 rounded-2xl border border-slate-100 bg-slate-50 space-y-3">
+            <h5 className="text-xs font-black text-slate-800 flex items-center gap-1.5 pb-1 border-b border-slate-200/60">
+              <span>●</span> طريقة الطباعة الافتراضية عند إصدار الإيصالات:
+            </h5>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+              <button
+                type="button"
+                onClick={() => {
+                  blePrinter.setDefaultPrintMethod('browser');
+                  triggerToast('🔌 تم تحديد طباعة الويب الذكية كخيار افتراضي لمعالجة الفواتير.', 'success');
+                }}
+                className={`p-3 text-right rounded-xl border flex flex-col justify-between transition-all cursor-pointer active:scale-98 ${
+                  printerState.defaultPrintMethod === 'browser'
+                    ? 'bg-blue-50/70 border-blue-400 text-blue-900 shadow-3xs ring-2 ring-blue-500/10'
+                    : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                <div>
+                  <span className="font-extrabold text-[11.5px] flex items-center gap-1.5">
+                    <span className={`w-2.5 h-2.5 rounded-full flex items-center justify-center border ${printerState.defaultPrintMethod === 'browser' ? 'bg-blue-600 border-blue-600' : 'bg-transparent border-slate-400'}`}>
+                      {printerState.defaultPrintMethod === 'browser' && <span className="w-1 h-1 bg-white rounded-full"></span>}
+                    </span>
+                    طباعة الويب عبر المتصفح (توافق 100%)
+                  </span>
+                  <p className="text-[10px] text-slate-500 mt-1.5 leading-relaxed font-semibold">
+                    الخيار الأكثر ثباتاً وسرعة. يعمل بضغطة واحدة من أي هاتف (iPhone، Android) أو حاسوب دون أي اقتران معقد. يدعم كافة أنواع الطابعات وتغيير مقاسات الورق (58mm / 80mm).
+                  </p>
+                </div>
+                <span className="text-[9px] font-bold text-blue-600/80 mt-2 block bg-blue-100/50 px-2 py-0.5 rounded-lg w-fit">موصى به لمتصفحات المحمول 📱</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  blePrinter.setDefaultPrintMethod('ble');
+                  triggerToast('⚡ تم تفعيل نقل البيانات الحراري المباشر (Web BLE Printer) كخيار افتراضي.', 'success');
+                }}
+                className={`p-3 text-right rounded-xl border flex flex-col justify-between transition-all cursor-pointer active:scale-98 ${
+                  printerState.defaultPrintMethod === 'ble'
+                    ? 'bg-indigo-50/70 border-indigo-400 text-indigo-900 shadow-3xs ring-2 ring-indigo-500/10'
+                    : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                <div>
+                  <span className="font-extrabold text-[11.5px] flex items-center gap-1.5">
+                    <span className={`w-2.5 h-2.5 rounded-full flex items-center justify-center border ${printerState.defaultPrintMethod === 'ble' ? 'bg-indigo-600 border-indigo-600' : 'bg-transparent border-slate-400'}`}>
+                      {printerState.defaultPrintMethod === 'ble' && <span className="w-1 h-1 bg-white rounded-full"></span>}
+                    </span>
+                    طباعة بلوتوث حرارية مباشرة (Web BLE API)
+                  </span>
+                  <p className="text-[10px] text-slate-500 mt-1.5 leading-relaxed font-semibold">
+                    اتصال لاسلكي مباشر لترجمة وتغذية الأسطر الرسومية للطابعة عبر البلوتوث. (يتطلب متصفح Chrome أو متصفح يدعم البلوتوث، ويعمل خارج نافذة المعاينة iFrame).
+                  </p>
+                </div>
+                <span className="text-[9px] font-bold text-indigo-600/80 mt-2 block bg-indigo-100/50 px-2 py-0.5 rounded-lg w-fit">مناسب لطابعات الفواتير الصينية المحمولة ⚡</span>
+              </button>
             </div>
           </div>
 
@@ -562,6 +633,7 @@ export default function Settings({
               </button>
             ) : (
               <button
+                type="button"
                 onClick={handleConnectPrinter}
                 disabled={printerState.isConnecting}
                 className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-extrabold text-[10.5px] rounded-xl flex items-center gap-1.5 active:scale-95 transition-transform cursor-pointer shadow-3xs shrink-0"
@@ -571,6 +643,52 @@ export default function Settings({
               </button>
             )}
           </div>
+
+          {/* Connection progress loader */}
+          {printerState.isConnecting && printerState.statusMessage && (
+            <div className="p-3.5 rounded-2xl border border-indigo-100 bg-indigo-50/40 text-xs space-y-2 animate-pulse text-right">
+              <div className="flex justify-between items-center text-[11px] font-bold text-indigo-950">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-indigo-600 animate-ping shrink-0"></span>
+                  {printerState.statusMessage}
+                </span>
+                <span className="font-mono text-indigo-700 font-extrabold">{printerState.progress || 0}%</span>
+              </div>
+              <div className="w-full h-1.5 bg-indigo-100 rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-indigo-600 rounded-full transition-all duration-300"
+                  style={{ width: `${printerState.progress || 0}%` }}
+                ></div>
+              </div>
+            </div>
+          )}
+
+          {/* Connection detailed error banner */}
+          {printerState.error && (
+            <div className="p-4 rounded-2xl border border-rose-100 bg-rose-50/50 text-xs space-y-2.5 text-right animate-fade-in">
+              <div className="flex items-start gap-2">
+                <span className="text-base leading-none shrink-0 mt-0.5">⚠️</span>
+                <div className="space-y-1.5 text-rose-950 w-full">
+                  <p className="font-extrabold text-[11.5px] text-rose-800">تفاصيل وتوجيهات معالجة الخطأ:</p>
+                  <p className="font-semibold leading-relaxed whitespace-pre-line text-rose-900 bg-white/70 p-3 rounded-xl border border-rose-100">
+                    {printerState.error}
+                  </p>
+                </div>
+              </div>
+              {(printerState.error.includes('iframe') || printerState.error.includes('SecurityError') || printerState.error.includes('disallowed')) && (
+                <div className="pt-1.5 flex flex-wrap gap-2 justify-end">
+                  <a
+                    href={window.location.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-[10px] rounded-xl shadow-3xs hover:shadow-2xs active:scale-98 transition-all flex items-center gap-1"
+                  >
+                    <span>فتح التطبيق في علامة تبويب جديدة 🔗</span>
+                  </a>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Printer configuration details */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
@@ -642,6 +760,132 @@ export default function Settings({
                 <Printer className="w-4 h-4" />
                 <span>طباعة صفحة اختبار حرارية</span>
               </button>
+            </div>
+          </div>
+
+          {/* Dynamic transmission & rendering calibration settings */}
+          <div className="p-4 rounded-2xl border border-slate-100 bg-slate-50/60 space-y-4">
+            <h5 className="text-xs font-black text-slate-800 flex items-center gap-1.5 pb-1 border-b border-slate-200/60">
+              <span className="text-indigo-600">⚡</span> معايرة الرأس الحراري ونقل الحزم (Transmission Calibration):
+            </h5>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+              {/* Chunk Size Control */}
+              <div className="space-y-1.5">
+                <div className="flex justify-between items-center">
+                  <span className="font-bold text-slate-700">حجم حزمة النقل (Chunk Size)</span>
+                  <span className="font-mono text-[11px] bg-slate-200 px-1.5 py-0.5 rounded-md text-slate-800 font-extrabold">{chunkSize} Byte</span>
+                </div>
+                <input
+                  type="range"
+                  min="20"
+                  max="180"
+                  step="10"
+                  value={chunkSize}
+                  onChange={(e) => {
+                    const val = Number(e.target.value);
+                    setChunkSizeState(val);
+                    blePrinter.setTransmissionParams(val, chunkDelay);
+                  }}
+                  className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                />
+                <p className="text-[9px] text-slate-400 font-semibold leading-relaxed">
+                  حجم الحزمة النبضية بالبايت في كل دفعة. يُنصَح بـ **40 Byte** للطابعات التجارية الرخيصة لتجنب سقوط الأسطر أو اختفاء الأجزاء.
+                </p>
+              </div>
+
+              {/* Chunk Delay Control */}
+              <div className="space-y-1.5">
+                <div className="flex justify-between items-center">
+                  <span className="font-bold text-slate-700">تأخير دفع الحزم (Packet Delay)</span>
+                  <span className="font-mono text-[11px] bg-slate-200 px-1.5 py-0.5 rounded-md text-slate-800 font-extrabold">{chunkDelay} ms</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={chunkDelay}
+                  onChange={(e) => {
+                    const val = Number(e.target.value);
+                    setChunkDelayState(val);
+                    blePrinter.setTransmissionParams(chunkSize, val);
+                  }}
+                  className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                />
+                <p className="text-[9px] text-slate-400 font-semibold leading-relaxed">
+                  مدة الانتظار بالملي ثانية بين الدفعات. يُنصَح بـ **15 ms** لمنع حدوث غلق لقنوات GATT البكسلية على الهواتف الضعيفة.
+                </p>
+              </div>
+
+              {/* Contrast Threshold Control */}
+              <div className="space-y-1.5">
+                <div className="flex justify-between items-center">
+                  <span className="font-bold text-slate-700">درجة التباين والوضوح (Contrast Threshold)</span>
+                  <span className="font-mono text-[11px] bg-slate-200 px-1.5 py-0.5 rounded-md text-slate-800 font-extrabold">{contrastThreshold}</span>
+                </div>
+                <input
+                  type="range"
+                  min="60"
+                  max="200"
+                  step="5"
+                  value={contrastThreshold}
+                  onChange={(e) => {
+                    const val = Number(e.target.value);
+                    setContrastThresholdState(val);
+                    blePrinter.setRenderParams(val, ditheringEnabled);
+                  }}
+                  className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                />
+                <p className="text-[9px] text-slate-400 font-semibold leading-relaxed">
+                  قيمة عتبة تحويل البكسلات الحرة للون الأسود بالكامل. القيمة الأقل تجعل الفاتورة فاتحة والخط نحيفاً، بينما القيمة الأعلى تجعله داكناً وممتلئاً.
+                </p>
+              </div>
+
+              {/* Dithering Mode Toggle */}
+              <div className="space-y-1.5 flex flex-col justify-between">
+                <div className="flex justify-between items-center">
+                  <span className="font-bold text-slate-700">تقنية معالجة التدرج الرسومي (Dithering)</span>
+                  <span className={`text-[9px] font-extrabold px-1.5 py-0.5 rounded-md ${ditheringEnabled ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-200 text-slate-600'}`}>
+                    {ditheringEnabled ? 'مفعّلة (Floyd-Steinberg)' : 'خيار التباين القاسي'}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDitheringEnabledState(true);
+                      blePrinter.setRenderParams(contrastThreshold, true);
+                      triggerToast('🎨 تم تفعيل ميزة التدرج الرسومي Floyd-Steinberg فائقة الدقة لفواتير رائعة.', 'info');
+                    }}
+                    className={`flex-1 py-1.5 text-center font-bold rounded-lg cursor-pointer transition-all ${
+                      ditheringEnabled 
+                        ? 'bg-indigo-600 text-white shadow-3xs' 
+                        : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    تدريج فائق الدقة
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDitheringEnabledState(false);
+                      blePrinter.setRenderParams(contrastThreshold, false);
+                      triggerToast('⚡ تم اختيار نمط التباين القاسي، وهو الأسرع والأكثر ملائمة للنصوص البسيطة.', 'info');
+                    }}
+                    className={`flex-1 py-1.5 text-center font-bold rounded-lg cursor-pointer transition-all ${
+                      !ditheringEnabled 
+                        ? 'bg-indigo-600 text-white shadow-3xs' 
+                        : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    تباين حاد (افتراضي)
+                  </button>
+                </div>
+                <p className="text-[9px] text-slate-400 font-semibold leading-relaxed">
+                  تساعد خوارزمية **Floyd-Steinberg** في تشتيت اللون لإعطاء الصور والرموز الرقمية واللوغات تدرجات دقيقة جداً ومتقاطعة على الورق الحراري.
+                </p>
+              </div>
             </div>
           </div>
 

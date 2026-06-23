@@ -67,87 +67,7 @@ export default function ReceiptModal({ receipt, onClose, onPrint }: ReceiptModal
     if (onPrint) {
       onPrint();
     } else {
-      let iframe = document.getElementById('print-frame') as HTMLIFrameElement | null;
-      if (!iframe) {
-        iframe = document.createElement('iframe');
-        iframe.id = 'print-frame';
-        iframe.style.position = 'fixed';
-        iframe.style.right = '0';
-        iframe.style.bottom = '0';
-        iframe.style.width = '0';
-        iframe.style.height = '0';
-        iframe.style.border = '0';
-        document.body.appendChild(iframe);
-      }
-
-      const doc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (doc) {
-        doc.open();
-        doc.write(`
-          <html>
-            <head>
-              <title>وصل تسديد - ${receiptTitle}</title>
-              <style>
-                @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700&display=swap');
-                body {
-                  font-family: 'Cairo', sans-serif;
-                  direction: rtl;
-                  padding: 20px;
-                  text-align: center;
-                  color: #333;
-                }
-                .ticket {
-                  max-width: 300px;
-                  margin: 0 auto;
-                  border: 1px dashed #666;
-                  padding: 15px;
-                }
-                .header { font-size: 18px; font-weight: bold; margin-bottom: 5px; }
-                .sub-header { font-size: 11px; color: #666; margin-bottom: 8px; }
-                .divider { border-top: 1px dashed #ccc; margin: 10px 0; }
-                .row { display: flex; justify-content: space-between; font-size: 13px; margin: 5px 0; }
-                .row.bold { font-weight: bold; font-size: 15px; }
-                .footer { font-size: 11px; color: #555; margin-top: 15px; font-weight: bold; }
-                .barcode { font-family: monospace; font-size: 12px; margin-top: 10px; border: 1px solid #000; padding: 4px; display: inline-block; }
-              </style>
-            </head>
-            <body>
-              <div class="ticket">
-                <div class="header">${receiptTitle}</div>
-                <div class="sub-header">${receiptFirm}</div>
-                ${receiptPhone ? `<div class="sub-header">هاتف التنسيق: ${receiptPhone}</div>` : ''}
-                <div class="divider"></div>
-                <div class="row bold"><span>وصل استلام مالي</span> <span>مُسدد 🟢</span></div>
-                <div class="row"><span>رقم الوصل:</span> <span>${receipt.invoiceNo}</span></div>
-                <div class="row"><span>التاريخ:</span> <span>${receipt.paymentDate}</span></div>
-                <div class="divider"></div>
-                <div class="row"><span>اسم المشترك:</span> <span>${receipt.subscriberName}</span></div>
-                <div class="row"><span>رقم الهاتف:</span> <span>${receipt.subscriberPhone}</span></div>
-                <div class="row"><span>نوع الاشتراك:</span> <span>${receipt.subscriptionType}</span></div>
-                <div class="row"><span>عدد الأمبيرات:</span> <span>${receipt.amps} أمبير</span></div>
-                <div class="row"><span>سعر الأمبير:</span> <span>${receipt.pricePerAmp.toLocaleString()} د.ع</span></div>
-                <div class="divider"></div>
-                <div class="row bold"><span>المبلغ المدفوع:</span> <span>${receipt.totalAmount.toLocaleString()} د.ع</span></div>
-                <div class="row"><span>طريقة الدفع:</span> <span>${receipt.paymentMethod}</span></div>
-                <div class="row"><span>المستلم:</span> <span>${receipt.accountantName}</span></div>
-                <div class="divider"></div>
-                <p class="footer">${receiptFooter}</p>
-                <div>
-                  <div class="barcode">||||| |*| ${receipt.invoiceNo} |*||||||</div>
-                </div>
-                <div style="font-size: 9px; margin-top: 5px; color: #aaa;">نظام إدارة المولدات - شركة الحلول المتميزة EX</div>
-              </div>
-              <script>
-                window.onload = function() {
-                  window.focus();
-                  window.print();
-                }
-              </script>
-            </body>
-          </html>
-        `);
-        doc.close();
-      }
+      blePrinter.printViaBrowser(receipt);
     }
   };
 
@@ -324,35 +244,65 @@ export default function ReceiptModal({ receipt, onClose, onPrint }: ReceiptModal
         {/* Receipt actions (Not printable) */}
         <div className="p-4 bg-gray-50 border-t border-gray-100 flex flex-col gap-3 no-print">
           
-          {/* Primary Bluetooth Print Actions */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            <button
-              onClick={handleBLEPrint}
-              disabled={isPrinting}
-              className={`py-3 px-3.5 text-white font-black text-xs rounded-xl flex items-center justify-center gap-1.5 cursor-pointer active:scale-97 transition-all ${
-                printerState.isConnected 
-                  ? 'bg-indigo-600 hover:bg-indigo-700 shadow-3xs' 
-                  : 'bg-indigo-600 hover:bg-indigo-700'
-              }`}
-            >
-              <Bluetooth className={`w-4 h-4 ${isPrinting ? 'animate-spin' : ''}`} />
-              <span>
-                {isPrinting 
-                  ? 'جاري إرسال البيانات...' 
-                  : printerState.isConnected 
-                  ? 'طباعة حرارية فورية ⚡' 
-                  : 'اقتران وطباعة حرارية (BLE)'}
-              </span>
-            </button>
+          {/* Primary Print Actions Based on Default Preferences */}
+          <div className="flex flex-col gap-2">
+            {printerState.defaultPrintMethod === 'browser' ? (
+              <>
+                <button
+                  onClick={handlePrint}
+                  disabled={isPrinting}
+                  className="py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white font-black text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer active:scale-97 transition-all shadow-md shadow-blue-500/15"
+                >
+                  <Printer className="w-4 h-4" />
+                  <span>طباعة الويب الذكية (الافتراضية) 🖨️</span>
+                </button>
+                
+                <button
+                  onClick={handleBLEPrint}
+                  disabled={isPrinting}
+                  className={`py-2.5 px-4 text-xs font-bold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer active:scale-97 transition-all ${
+                    printerState.isConnected 
+                      ? 'bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100' 
+                      : 'bg-white border border-gray-350 text-gray-700 hover:bg-gray-50'
+                  }`}
+                >
+                  <Bluetooth className={`w-3.5 h-3.5 ${isPrinting ? 'animate-spin' : 'text-indigo-600'}`} />
+                  <span>
+                    {isPrinting 
+                      ? 'جاري إرسال البيانات للتذكرة...' 
+                      : printerState.isConnected 
+                      ? 'طباعة حرارية مباشرة بالبلوتوث ⚡' 
+                      : 'اقتران وطباعة حرارية (BLE)'}
+                  </span>
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={handleBLEPrint}
+                  disabled={isPrinting}
+                  className="py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer active:scale-97 transition-all shadow-md shadow-indigo-500/15"
+                >
+                  <Bluetooth className={`w-4 h-4 ${isPrinting ? 'animate-spin' : ''}`} />
+                  <span>
+                    {isPrinting 
+                      ? 'جاري إرسال البيانات للتذكرة...' 
+                      : printerState.isConnected 
+                      ? 'طباعة حرارية مباشرة بالبلوتوث (الافتراضية) ⚡' 
+                      : 'اقتران وطباعة حرارية (BLE)'}
+                  </span>
+                </button>
 
-            <button
-              onClick={handlePrint}
-              disabled={isPrinting}
-              className="py-3 px-3.5 bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 cursor-pointer active:scale-97 transition-all"
-            >
-              <Printer className="w-4 h-4 text-gray-500" />
-              <span>طباعة النظام (عادية)</span>
-            </button>
+                <button
+                  onClick={handlePrint}
+                  disabled={isPrinting}
+                  className="py-2.5 px-4 bg-white border border-gray-350 text-gray-700 hover:bg-gray-50 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 cursor-pointer active:scale-97 transition-all"
+                >
+                  <Printer className="w-3.5 h-3.5 text-gray-500" />
+                  <span>طباعة بديلة عبر المتصفح 🖨️</span>
+                </button>
+              </>
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-2">

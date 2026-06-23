@@ -6,14 +6,17 @@
 import { Receipt } from '../types';
 
 // Let's declare the Bluetooth types for TypeScript safety
-type BluetoothEvent = Event & { target: any };
-
 export interface BLEPrinterState {
   isConnected: boolean;
   isConnecting: boolean;
   deviceName: string | null;
   paperWidth: '58mm' | '80mm';
   printerType: 'esc_pos' | 'cat_printer';
+  defaultPrintMethod: 'browser' | 'ble';
+  chunkSize: number;       // Safe split size for budget devices (default: 40 bytes)
+  chunkDelay: number;      // Safe pause between socket writes in ms (default: 15 ms)
+  contrastThreshold: number; // For standard thresholding (50 - 200, default: 135)
+  ditheringEnabled: boolean; // Enables Floyd-Steinberg dithering for higher definition images
   error: string | null;
   statusMessage?: string | null;
   progress?: number;
@@ -31,14 +34,18 @@ class BLEPrinterController {
     deviceName: null,
     paperWidth: (localStorage.getItem('ble_printer_width') as any) || '58mm',
     printerType: (localStorage.getItem('ble_printer_type') as any) || 'esc_pos',
+    defaultPrintMethod: (localStorage.getItem('default_print_method') as any) || 'browser',
+    chunkSize: Number(localStorage.getItem('ble_chunk_size')) || 40,
+    chunkDelay: Number(localStorage.getItem('ble_chunk_delay')) || 15,
+    contrastThreshold: Number(localStorage.getItem('ble_contrast_threshold')) || 135,
+    ditheringEnabled: localStorage.getItem('ble_dithering_enabled') === 'true',
     error: null,
     statusMessage: null,
     progress: 0,
   };
 
   constructor() {
-    // Attempt automatic disconnection listener if device is cached
-    // In browser environment, auto-reconnect can be configured
+    // Attempt automatic disconnection listener setup if cached
   }
 
   public subscribe(listener: (state: BLEPrinterState) => void) {
@@ -54,6 +61,11 @@ class BLEPrinterController {
     this.stateChangeListeners.forEach(listener => listener({ ...this.state }));
   }
 
+  public setDefaultPrintMethod(method: 'browser' | 'ble') {
+    this.updateState({ defaultPrintMethod: method });
+    localStorage.setItem('default_print_method', method);
+  }
+
   public setPaperWidth(width: '58mm' | '80mm') {
     this.updateState({ paperWidth: width });
     localStorage.setItem('ble_printer_width', width);
@@ -65,6 +77,21 @@ class BLEPrinterController {
     if (type === 'cat_printer') {
       this.setPaperWidth('58mm');
     }
+  }
+
+  public setTransmissionParams(chunkSize: number, chunkDelay: number) {
+    const size = Math.max(10, Math.min(512, chunkSize));
+    const delay = Math.max(0, Math.min(250, chunkDelay));
+    this.updateState({ chunkSize: size, chunkDelay: delay });
+    localStorage.setItem('ble_chunk_size', String(size));
+    localStorage.setItem('ble_chunk_delay', String(delay));
+  }
+
+  public setRenderParams(contrastThreshold: number, ditheringEnabled: boolean) {
+    const threshold = Math.max(10, Math.min(240, contrastThreshold));
+    this.updateState({ contrastThreshold: threshold, ditheringEnabled });
+    localStorage.setItem('ble_contrast_threshold', String(threshold));
+    localStorage.setItem('ble_dithering_enabled', String(ditheringEnabled));
   }
 
   public getCustomServiceUuid(): string | null {
@@ -91,8 +118,9 @@ class BLEPrinterController {
     }
   }
 
-  // Generate a comprehensive, 100% compliant list of potential custom service UUIDs
-  // All elements are structured as standard 128-bit lowercase strings to prevent browser-specific TypeError rejections
+  /**
+   * Generates a broad compatibility list of potential custom service UUIDs
+   */
   private getComprehensivePrinterServices(): string[] {
     const services = new Set<string>([
       // General transparent UART and printer standard channels
@@ -162,7 +190,7 @@ class BLEPrinterController {
 
       const comprehensiveServices = this.getComprehensivePrinterServices();
 
-      // Request Bluetooth thermal printer device
+      // Request Bluetooth device
       const device = await nav.bluetooth.requestDevice({
         acceptAllDevices: true,
         optionalServices: comprehensiveServices
@@ -171,7 +199,7 @@ class BLEPrinterController {
       this.device = device;
       this.updateState({ 
         deviceName: device.name || 'طابعة حرارية BLE',
-        statusMessage: `تم تحديد الطابعة "${device.name || 'مجهولة'}". جاري وبدء الاتصال بقنوات GATT...`,
+        statusMessage: `تم تحديد الطابعة "${device.name || 'مجهولة'}". جاري بدء اتصال GATT آمن...`,
         progress: 30
       });
 
@@ -185,11 +213,11 @@ class BLEPrinterController {
       this.gattServer = server;
       
       this.updateState({
-        statusMessage: 'تم إنشاء الاتصال بنجاح. جاري البحث المتقدم عن قنوات الكتابة المتوافقة...',
+        statusMessage: 'تم التوصيل بخادم البلوتوث. جاري تمشيط قنوات الكتابة المتوافقة...',
         progress: 60
       });
 
-      // Classify characteristic
+      // Clean characteristic
       const writeChar = await this.discoverWriteCharacteristic(server, device);
       this.writeCharacteristic = writeChar;
       
@@ -197,7 +225,7 @@ class BLEPrinterController {
         isConnected: true, 
         isConnecting: false, 
         error: null,
-        statusMessage: 'تم الاقتران وتفعيل قناة الطباعة الحرارية بنجاح تام! ⚡',
+        statusMessage: 'تم الاقتران وتأكيد حزم الاتصال بالطابعة بنجاح! ⚡',
         progress: 100
       });
 
@@ -225,7 +253,7 @@ class BLEPrinterController {
   }
 
   /**
-   * Verify if GATT is physically connected and characteristic is ready; if not, attempt auto-reconnect or full connect
+   * Verified if GATT is physically connected and characteristic is ready; if not, attempt auto-reconnect or full connect
    */
   public async ensureConnected(): Promise<boolean> {
     if (this.device && this.device.gatt && this.device.gatt.connected && this.writeCharacteristic) {
@@ -235,7 +263,7 @@ class BLEPrinterController {
 
     if (this.device) {
       try {
-        console.log('BLE Printer: Disconnection detected. Attempting silent GATT reconnection...');
+        console.log('BLE Printer: GATT disconnected. Re-engaging link...');
         this.updateState({ isConnecting: true, isConnected: false, error: null });
         
         const server = await this.device.gatt.connect();
@@ -248,7 +276,7 @@ class BLEPrinterController {
           return true;
         }
       } catch (reconnectErr: any) {
-        console.warn('BLE Printer auto-reconnection failed. Forcing full pair/connection:', reconnectErr);
+        console.warn('Silent recon failed, engaging user dialog:', reconnectErr);
         this.handleDisconnection();
       }
     }
@@ -273,9 +301,9 @@ class BLEPrinterController {
     }
     const candidates: Candidate[] = [];
 
-    // 1. Primary method: Retrieve all matching services provided by the browser in one call.
+    // Query active primary services
     try {
-      console.log('Querying all allowed primary services on connected device...');
+      console.log('Querying primary services on connected device...');
       const activeServices = await server.getPrimaryServices();
       
       for (const s of activeServices) {
@@ -310,16 +338,16 @@ class BLEPrinterController {
             }
           }
         } catch (innerError) {
-          console.warn(`Failed to discover characteristics for service ${s.uuid}:`, innerError);
+          console.warn(`Could not fetch characteristics for ${s.uuid}:`, innerError);
         }
       }
     } catch (getServicesError) {
-      console.warn('Batch discovery of services threw an error, falling back to individual queries:', getServicesError);
+      console.warn('Primary service batch discovery error, utilizing fallbacks:', getServicesError);
     }
 
-    // 2. Fallback method: If batch discovery yielded no results or candidates, query individual services.
+    // Fallback: Individual UUID checks
     if (candidates.length === 0) {
-      console.log('Falling back to querying individual popular service UUIDs...');
+      console.log('Executing individual fallback channel audits...');
       
       const customService = this.getCustomServiceUuid();
       const priorityServicesList = [
@@ -329,29 +357,24 @@ class BLEPrinterController {
         '0000fff0-0000-1000-8000-00805f9b34fb',
         '0000ffd0-0000-1000-8000-00805f9b34fb',
         '0000ff00-0000-1000-8000-00805f9b34fb',
-        '0000ae30-0000-1000-8000-00805f9b34fb',
-        '000018f0-0000-1000-8000-00805f9b34fb',
         '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
         '49535343-fe7d-4ae5-8fa9-9fafd205e455',
       ];
 
-      // Remove duplicates from priority list
       const priorityServices = Array.from(new Set(priorityServicesList));
 
       for (const serviceUUID of priorityServices) {
         try {
           const service = await server.getPrimaryService(serviceUUID);
           if (service) {
-            if (!discoveredServicesList.includes(service.uuid)) {
-              discoveredServicesList.push(service.uuid);
-            }
+            discoveredServicesList.push(service.uuid);
             const characteristics = await service.getCharacteristics();
-            const sScore = this.getServiceScore(service.uuid);
+            const sScore = this.getServiceScore(serviceUUID);
 
             for (const char of characteristics) {
               const props = char.properties;
               discoveredCharList.push({
-                serviceUuid: service.uuid,
+                serviceUuid: serviceUUID,
                 charUuid: char.uuid,
                 properties: {
                   write: props.write,
@@ -365,7 +388,7 @@ class BLEPrinterController {
               if (cScore > 0) {
                 candidates.push({
                   char,
-                  serviceUuid: service.uuid,
+                  serviceUuid: serviceUUID,
                   charUuid: char.uuid,
                   serviceScore: sScore,
                   charScore: cScore,
@@ -374,8 +397,8 @@ class BLEPrinterController {
               }
             }
           }
-        } catch (e) {
-          // not found, continue
+        } catch (sErr) {
+          // Normal fallback flow
         }
       }
     }
@@ -383,29 +406,29 @@ class BLEPrinterController {
     if (candidates.length > 0) {
       candidates.sort((a, b) => b.totalScore - a.totalScore);
       const bestCandidate = candidates[0];
-      console.log(`[Priority-Scoring Selected] Selected char: ${bestCandidate.charUuid} under service ${bestCandidate.serviceUuid} (Score: ${bestCandidate.totalScore})`);
+      console.log(`[Selected Bluetooth Socket] Channel: ${bestCandidate.charUuid} on Service: ${bestCandidate.serviceUuid} (Rank: ${bestCandidate.totalScore})`);
       return bestCandidate.char;
     }
 
     const uniqueServices = Array.from(new Set(discoveredServicesList));
     const servicesSummary = uniqueServices.length > 0 
       ? uniqueServices.map(uuid => `• ${uuid.substring(4, 8).toUpperCase()} (${uuid})`).join('\n') 
-      : '• لم يتم اكتشاف خدمات مسموحة أو خدمات متوافقة.';
+      : '• لم نكتشف أي خدمات مرخصة أو مدعومة.';
 
     const charSummary = discoveredCharList.length > 0
-      ? discoveredCharList.map(c => `• القناة: ${c.charUuid.substring(4, 8).toUpperCase()}, الخدمة: ${c.serviceUuid.substring(4, 8).toUpperCase()} [الكتابة: ${c.properties.write ? 'متاحة' : 'غير متاحة'}]`).join('\n')
-      : '• لم يتم العثور على أي قنوات.';
+      ? discoveredCharList.map(c => `• القناة: ${c.charUuid.substring(4, 8).toUpperCase()}, الخدمة: ${c.serviceUuid.substring(4, 8).toUpperCase()} [كتابة: ${c.properties.write ? 'متاحة' : 'غير متاحة'}]`).join('\n')
+      : '• لم يتم اكتشاف قنوات للكتابة.';
 
     throw new Error(
-      `❌ لم يتم العثور على القناة المخصصة للكتابة والطباعة في هذا الجهاز.\n\n` +
-      `• اسم الجهاز المتصل: ${device.name || 'طابعة حرارية'}\n` +
-      `• الخدمات المكتشفة بنجاح:\n${servicesSummary}\n\n` +
-      `• قنوات الاتصال المكتشفة:\n${charSummary}`
+      `❌ تعذر اكتشاف قناة الطباعة اللاسلكية المتوافقة في هذه الطابعة.\n\n` +
+      `• الاسم المسجل: ${device.name || 'طابعة حرارية'}\n` +
+      `• الخدمات النشطة:\n${servicesSummary}\n\n` +
+      `• القنوات الفرعية المكتشفة:\n${charSummary}`
     );
   }
 
   /**
-   * Gracefully disconnect from active printer
+   * Disconnect from current printer
    */
   public disconnect() {
     if (this.gattServer && this.gattServer.connected) {
@@ -426,15 +449,16 @@ class BLEPrinterController {
   }
 
   /**
-   * Raw printer helper to send chunked byte buffers sequentially with a brief rest to avoid printer RX buffer buffer overflow crashes.
+   * Raw printer helper to send chunked byte buffers sequentially with customized delays.
+   * This is critical to prevent cheap portable printers from choking, crashing, or cutting off lines.
    */
   private async sendBuffer(data: Uint8Array): Promise<void> {
     if (!this.writeCharacteristic) {
-      throw new Error('الطابعة غير متصلة حالياً. الرجاء الاتصال بالطابعة أولاً.');
+      throw new Error('الطابعة غير متصلة حالياً. الرجاء الاقتران بالطابعة أولاً.');
     }
 
-    // Optimized chunk size to 120 bytes to match typical BLE MTUs (prevents GATT stack delays)
-    const maxChunkSize = 120;
+    const maxChunkSize = this.state.chunkSize;
+    const chunkDelayMs = this.state.chunkDelay;
     let offset = 0;
 
     const props = this.writeCharacteristic.properties;
@@ -447,7 +471,6 @@ class BLEPrinterController {
       let retries = 3;
 
       while (!success && retries > 0) {
-        // Construct standard write execution
         const attemptWrite = async () => {
           if (canWriteWithoutResponse && typeof this.writeCharacteristic.writeValueWithoutResponse === 'function') {
             await this.writeCharacteristic.writeValueWithoutResponse(chunk);
@@ -462,11 +485,9 @@ class BLEPrinterController {
           }
         };
 
-        // Construct 1200ms timeout promise. Budget receipt printers often accept serial data but neglect to return Bluetooth GATT ACK packets.
-        // If a standard write hangs, we do not lock up the user interface. We assume it printed on the chip's internal buffer and move on.
         let timeoutId: any;
         const timeoutPromise = new Promise((_, reject) => {
-          timeoutId = setTimeout(() => reject(new Error('GATT_TIMEOUT')), 1200);
+          timeoutId = setTimeout(() => reject(new Error('GATT_TIMEOUT')), 1500);
         });
 
         try {
@@ -476,14 +497,13 @@ class BLEPrinterController {
           const errMsg = err.message || '';
           
           if (errMsg === 'GATT_TIMEOUT') {
-            console.warn('GATT write ACK timed out (possible budget printer without Bluetooth confirmations). Assuming success to prevent system freeze...');
-            success = true; // Assume sent successfully on ACK-less devices
+            console.warn('GATT ACK timed out. Forcing flush to next segment...');
+            success = true; 
           } else if (errMsg.includes('in progress') || errMsg.includes('busy') || err.name === 'NetworkError') {
             retries--;
-            console.warn(`GATT busy/in-progress error. Cooling down and retrying... (${retries} left)`);
-            await new Promise(resolve => setTimeout(resolve, 80)); // Let the GATT queue clear
+            console.warn(`GATT pipeline congested. Refreshing, Retries left: ${retries}...`);
+            await new Promise(resolve => setTimeout(resolve, 100)); 
           } else {
-            // Unrecognized failure: attempt fallback to general writeValue directly
             try {
               const fallbackPromise = (async () => {
                 if (typeof this.writeCharacteristic.writeValue === 'function') {
@@ -500,14 +520,13 @@ class BLEPrinterController {
             } catch (innerErr: any) {
               const innerMsg = innerErr.message || '';
               if (innerMsg === 'GATT_TIMEOUT') {
-                console.warn('GATT fallback write ACK timed out. Continuing print loop...');
                 success = true;
               } else if (innerMsg.includes('in progress') || innerMsg.includes('busy')) {
                 retries--;
-                await new Promise(resolve => setTimeout(resolve, 80));
+                await new Promise(resolve => setTimeout(resolve, 100));
               } else {
-                console.error('All write attempts and fallbacks failed:', innerErr);
-                throw new Error('فشلت كتابة البيانات لمخزن البلوتوث. تأكد من أن الاتصال لا يزال نشطاً.');
+                console.error('All BLE transfer methods failed:', innerErr);
+                throw new Error('فشل إرسال حزمة الدفعات للبلوتوث. الرجاء تقريب الطابعة وإعادة الاقتران.');
               }
             }
           }
@@ -517,43 +536,32 @@ class BLEPrinterController {
       }
 
       if (!success) {
-        throw new Error('فشل إرسال البيانات المقطعة للطابعة بسبب انشغال ناقل حركة البلوتوث (GATT Busy).');
+        throw new Error('حدث احتقان مستمر في منقذ معلومات طابعة البلوتوث (GATT Busy). يرجى زيادة فترة التأخير بين الحزم من الإعدادات.');
       }
 
       offset += maxChunkSize;
       
-      // Minor microtask pause (2ms) instead of heavy 15ms delay inside a single command buffer
-      if (offset < data.length) {
-        await new Promise(resolve => setTimeout(resolve, 2));
+      if (offset < data.length && chunkDelayMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, chunkDelayMs));
       }
     }
   }
 
-  /**
-   * Standard ESC/POS commands initialization
-   */
   private getInitCommands(): Uint8Array {
-    return new Uint8Array([
-      0x1B, 0x40, // ESC @ (Initialize printer)
-    ]);
+    return new Uint8Array([0x1B, 0x40]); // ESC @ (Initialize)
   }
 
-  /**
-   * Feed and cutting commands
-   */
   private getFeedAndCutCommands(linesToFeed = 5): Uint8Array {
     const list = [];
-    // Emit standard LF (Line Feed) characters
     for (let i = 0; i < linesToFeed; i++) {
-      list.push(0x0A); // LF
+      list.push(0x0A);
     }
-    // Standard ESC/POS partial paper cut command (GS V 1) which is widely supported
-    list.push(0x1D, 0x56, 0x01);
+    list.push(0x1D, 0x56, 0x01); // Safe ESCPOS Partial cut
     return new Uint8Array(list);
   }
 
   /**
-   * Helper: Convert specific Canvas region (rectangle) to black-and-white Bitmap and build the ESC/POS Raster command GS v 0
+   * High performance bitmap parsing with Floyd-Steinberg dithering or adaptive thresholding
    */
   private convertCanvasRectToEscPosRaster(
     canvas: HTMLCanvasElement,
@@ -563,46 +571,92 @@ class BLEPrinterController {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Could not get canvas 2D context');
 
-    const width = canvas.width;    // Must be a multiple of 8! (384 for 58mm, 576 for 80mm)
+    const width = canvas.width;    
     const imgData = ctx.getImageData(0, startY, width, renderHeight);
     const pixels = imgData.data;
 
     const widthBytes = width / 8;
     const rasterDataSize = widthBytes * renderHeight;
-
     const rasterBytes = new Uint8Array(rasterDataSize);
 
-    for (let y = 0; y < renderHeight; y++) {
-      for (let x = 0; x < width; x++) {
-        const pixelIdx = (y * width + x) * 4;
+    const threshold = this.state.contrastThreshold;
+    const doDither = this.state.ditheringEnabled;
+
+    if (doDither) {
+      // 1. Floyd-Steinberg Dithering Error Diffusion
+      const grey = new Float32Array(width * renderHeight);
+      for (let i = 0; i < width * renderHeight; i++) {
+        const pixelIdx = i * 4;
         const r = pixels[pixelIdx];
-        const g = pixels[pixelIdx+1];
-        const b = pixels[pixelIdx+2];
-        const a = pixels[pixelIdx+3];
-
-        let isBlack = false;
+        const g = pixels[pixelIdx + 1];
+        const b = pixels[pixelIdx + 2];
+        const a = pixels[pixelIdx + 3];
+        // Luminance with alpha blending
         if (a < 50) {
-          // Transparent standard pixel is white
-          isBlack = false;
+          grey[i] = 255; // White background
         } else {
-          // Standard grayscale luminance formula
-          const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-          isBlack = luminance < 140; // Any pixel darker than threshold 140 is printed (Black)
+          grey[i] = 0.299 * r + 0.587 * g + 0.114 * b;
         }
+      }
 
-        if (isBlack) {
-          const byteIdx = y * widthBytes + Math.floor(x / 8);
-          const bitIdx = 7 - (x % 8);
-          rasterBytes[byteIdx] |= (1 << bitIdx);
+      for (let y = 0; y < renderHeight; y++) {
+        for (let x = 0; x < width; x++) {
+          const idx = y * width + x;
+          const oldVal = grey[idx];
+          const newVal = oldVal < threshold ? 0 : 255;
+          
+          if (newVal === 0) {
+            const byteIdx = y * widthBytes + Math.floor(x / 8);
+            const bitIdx = 7 - (x % 8);
+            rasterBytes[byteIdx] |= (1 << bitIdx);
+          }
+
+          const err = oldVal - newVal;
+          // Diffuse errors to neighbors
+          if (x + 1 < width) {
+            grey[idx + 1] += err * (7 / 16);
+          }
+          if (y + 1 < renderHeight) {
+            if (x - 1 >= 0) {
+              grey[idx + width - 1] += err * (3 / 16);
+            }
+            grey[idx + width] += err * (5 / 16);
+            if (x + 1 < width) {
+              grey[idx + width + 1] += err * (1 / 16);
+            }
+          }
+        }
+      }
+    } else {
+      // 2. Faster high-contrast thresholding (highly readable on budget receipts)
+      for (let y = 0; y < renderHeight; y++) {
+        for (let x = 0; x < width; x++) {
+          const pixelIdx = (y * width + x) * 4;
+          const r = pixels[pixelIdx];
+          const g = pixels[pixelIdx + 1];
+          const b = pixels[pixelIdx + 2];
+          const a = pixels[pixelIdx + 3];
+
+          let isBlack = false;
+          if (a >= 50) {
+            const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+            isBlack = luminance < threshold; 
+          }
+
+          if (isBlack) {
+            const byteIdx = y * widthBytes + Math.floor(x / 8);
+            const bitIdx = 7 - (x % 8);
+            rasterBytes[byteIdx] |= (1 << bitIdx);
+          }
         }
       }
     }
 
-    // Builder GS v 0 m xL xH yL yH [Raster Bytes]
+    // Command Header for ESC/POS Raster bit-image mode (GS v 0 m xL xH yL yH)
     const header = new Uint8Array([
-      0x1D, 0x76, 0x30, 0x00, // GS v 0 0 (Raster image command, normal scaling mode)
-      widthBytes % 256, Math.floor(widthBytes / 256), // xL xH (Width in bytes)
-      renderHeight % 256, Math.floor(renderHeight / 256) // yL yH (Height in dots/pixels)
+      0x1D, 0x76, 0x30, 0x00, 
+      widthBytes % 256, Math.floor(widthBytes / 256), 
+      renderHeight % 256, Math.floor(renderHeight / 256) 
     ]);
 
     const result = new Uint8Array(header.length + rasterBytes.length);
@@ -613,135 +667,120 @@ class BLEPrinterController {
   }
 
   /**
-   * Generate clean ticket layout on canvas, returning a compiled Uint8Array with raster command package.
+   * Renders the receipt beautifully to an off-screen HTMLCanvasElement
    */
   private renderReceiptToEscPosDevice(receipt: Receipt): HTMLCanvasElement {
     const canvas = document.createElement('canvas');
-    
-    // Width setup
     const is80 = this.state.paperWidth === '80mm';
     const width = is80 ? 576 : 384; 
-    const margin = is80 ? 35 : 15;
-    const printableWidth = width - (margin * 2);
+    const margin = is80 ? 32 : 12;
 
-    // Retrieve customized store parameters identical to ReceiptModal.tsx
     const receiptTitle = localStorage.getItem('receipt_title') || 'نظام مولدتي للخدمات الأهلية';
     const receiptFirm = localStorage.getItem('receipt_firm') || 'شركة الحلول المتميزة المحدودة';
     const receiptPhone = localStorage.getItem('receipt_phone') || '07701234567';
     const receiptFooter = localStorage.getItem('receipt_footer') || 'شكراً لالتزامكم بالتسديد الشهري.';
 
-    // Allocate a tall offscreen layout buffer (will be cropped dynamically at the end to prevent paper waste)
     const canvasHeight = 1100;
     canvas.width = width;
     canvas.height = canvasHeight;
 
     const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Canvas 2D failed');
+    if (!ctx) throw new Error('Could not launch Cairo canvas graphics renderer');
 
-    // Fill white background
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, width, canvasHeight);
 
-    // Render Text Configurations
-    ctx.fillStyle = '#000000'; // Print paint
+    ctx.fillStyle = '#000000'; 
     ctx.textBaseline = 'top';
 
     let currentY = 15;
 
-    // 1. Draw centered icon badge
+    // 1. Centered Badge
     ctx.beginPath();
     ctx.arc(width / 2, currentY + 20, 18, 0, Math.PI * 2);
     ctx.strokeStyle = '#000000';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1.8;
     ctx.stroke();
     
-    // Draw simple tiny lightning bolt inside circular badge
-    ctx.font = 'bold 16px "Segoe UI", Arial, sans-serif';
+    ctx.font = 'bold 16px "Cairo", "Segoe UI", Arial';
     ctx.textAlign = 'center';
     ctx.fillText('⚡', width / 2, currentY + 11);
     currentY += 45;
 
-    // 2. Custom header title (Centered)
-    ctx.font = `bold ${is80 ? '24px' : '18px'} "Segoe UI", "Cairo", Arial, sans-serif`;
+    // 2. Company Identity
+    ctx.font = `bold ${is80 ? '24px' : '18px'} "Cairo", "Segoe UI", sans-serif`;
     ctx.textAlign = 'center';
     ctx.fillText(receiptTitle, width / 2, currentY);
     currentY += is80 ? 30 : 25;
 
-    // Company/Firm
-    ctx.font = `bold ${is80 ? '14px' : '11px'} "Segoe UI", "Cairo", Arial, sans-serif`;
+    ctx.font = `bold ${is80 ? '14px' : '11px'} "Cairo", "Segoe UI", sans-serif`;
     ctx.fillText(receiptFirm, width / 2, currentY);
     currentY += 18;
 
-    // Phone Support
     if (receiptPhone) {
       ctx.font = '10px monospace';
-      ctx.fillText(`الدعم: ${receiptPhone}`, width / 2, currentY);
+      ctx.fillText(`طوارئ الشبكة: ${receiptPhone}`, width / 2, currentY);
       currentY += 15;
     }
 
-    // Divider Line
     this.drawDashedLine(ctx, margin, width - margin, currentY);
     currentY += 12;
 
-    // State Banner
-    ctx.font = `bold ${is80 ? '16px' : '13px'} "Segoe UI", "Cairo", Arial, sans-serif`;
-    ctx.fillText('⚡ وصل استلام مالي (مُسدّد بـالكامل) ⚡', width / 2, currentY);
+    ctx.font = `bold ${is80 ? '15px' : '12.5px'} "Cairo", "Segoe UI", sans-serif`;
+    ctx.fillText('وصل استلام مالي (مُسدّد بالكامل) 🟢', width / 2, currentY);
     currentY += is80 ? 25 : 22;
 
     this.drawDashedLine(ctx, margin, width - margin, currentY);
     currentY += 15;
 
-    // Key-Values layout rendering
-    const drawItemRow = (key: string, val: string, isSecBold = false) => {
+    // RTL Item Row aligned Helper
+    const drawItemRow = (key: string, val: string, isKeyBold = false) => {
       ctx.textAlign = 'right';
-      ctx.font = `${isSecBold ? 'bold' : ''} ${is80 ? '14px' : '11.5px'} "Segoe UI", "Cairo", Arial, sans-serif`;
+      ctx.font = `${isKeyBold ? 'bold' : ''} ${is80 ? '14px' : '11.5px'} "Cairo", "Segoe UI", sans-serif`;
       ctx.fillText(`${key}:`, width - margin, currentY);
 
       ctx.textAlign = 'left';
-      ctx.font = `bold ${is80 ? '14px' : '11.5px'} "Segoe UI", "Cairo", Arial, sans-serif`;
+      ctx.font = `bold ${is80 ? '14px' : '11.5px'} "Cairo", "Segoe UI", sans-serif`;
       ctx.fillText(val, margin, currentY);
       
-      currentY += is80 ? 24 : 20;
+      currentY += is80 ? 24 : 19;
     };
 
-    drawItemRow('رقم الوصل', receipt.invoiceNo, true);
-    drawItemRow('تاريخ ووقت السداد', receipt.paymentDate);
-    drawItemRow('اسم المستلم منه', receipt.subscriberName, true);
+    drawItemRow('رقم الإيصال الرقمي', receipt.invoiceNo, true);
+    drawItemRow('تاريخ السداد والتقييد', receipt.paymentDate);
+    drawItemRow('المشترك المستفيد', receipt.subscriberName, true);
     drawItemRow('الهاتف المسجل', receipt.subscriberPhone);
-    drawItemRow('الفئة والاشتراك', receipt.subscriptionType);
-    drawItemRow('الأمبيرات المشغل بها', `${receipt.amps} أمبير`);
-    drawItemRow('تسعيرة الأمبير المنظّم', `${receipt.pricePerAmp.toLocaleString()} د.ع`);
-    drawItemRow('بوابة التحصيل المالي', receipt.paymentMethod);
+    drawItemRow('صنف ونوع الاشتراك', receipt.subscriptionType);
+    drawItemRow('الأمبيرات المسجلة', `${receipt.amps} أمبير`);
+    drawItemRow('سعر الأمبير المقرّر', `${receipt.pricePerAmp.toLocaleString()} د.ع`);
+    drawItemRow('بوابة المعالجة المالية', receipt.paymentMethod);
     drawItemRow('الجابي المستلم', receipt.accountantName);
 
     this.drawDashedLine(ctx, margin, width - margin, currentY);
     currentY += 15;
 
-    // Highlight Paid Amount
     ctx.textAlign = 'center';
-    ctx.font = `bold ${is80 ? '13px' : '11px'} "Segoe UI", "Cairo", Arial, sans-serif`;
-    ctx.fillText('إجمالي المبلغ المقبوض والمسجل بنجاح:', width / 2, currentY);
+    ctx.font = `bold ${is80 ? '13px' : '11px'} "Cairo", "Segoe UI", sans-serif`;
+    ctx.fillText('إجمالي تصفية الحساب المستلم:', width / 2, currentY);
     currentY += 18;
 
-    ctx.font = `bold ${is80 ? '22px' : '17px'} monospace, "Segoe UI", Arial, sans-serif`;
+    ctx.font = `bold ${is80 ? '22px' : '17px'} monospace, "Segoe UI", sans-serif`;
     ctx.fillText(`${receipt.totalAmount.toLocaleString()} دينار عراقي`, width / 2, currentY);
     currentY += is80 ? 32 : 28;
 
     this.drawDashedLine(ctx, margin, width - margin, currentY);
     currentY += 12;
 
-    // Footer greeting message
     ctx.textAlign = 'center';
-    ctx.font = `bold ${is80 ? '11px' : '9.5px'} "Segoe UI", "Cairo", Arial, sans-serif`;
+    ctx.font = `bold ${is80 ? '11px' : '9.5px'} "Cairo", "Segoe UI", sans-serif`;
     ctx.fillText(receiptFooter, width / 2, currentY);
     currentY += 18;
 
-    // Simulated ticket Barcode design with lines
-    const barcodeCode = `*${receipt.invoiceNo}*`;
+    // Aesthetic Barcode
+    const barcodeText = `*${receipt.invoiceNo}*`;
     ctx.font = '10px monospace';
-    ctx.fillText(barcodeCode, width / 2, currentY + 22);
+    ctx.fillText(barcodeText, width / 2, currentY + 22);
 
-    // Draw raw barcode lines
     ctx.strokeStyle = '#000000';
     ctx.lineWidth = 1;
     const barcodeXStart = width / 2 - 70;
@@ -757,11 +796,10 @@ class BLEPrinterController {
     
     currentY += 45;
 
-    // System watermarks
-    ctx.font = '8px "Segoe UI", "Cairo", Arial, sans-serif';
-    ctx.fillText('نظام إدارة المولدات - شركة الحلول المتميزة EX', width / 2, currentY);
+    ctx.font = '8px "Cairo", "Segoe UI", sans-serif';
+    ctx.fillText('نظام إدارة المولدات والتحصيل الميداني الذكي', width / 2, currentY);
 
-    // Dynamic cropping: Create a secondary canvas with the exact height used
+    // Crop Canvas
     const finalHeight = Math.ceil(currentY + 25);
     const croppedCanvas = document.createElement('canvas');
     croppedCanvas.width = width;
@@ -788,7 +826,7 @@ class BLEPrinterController {
   }
 
   /**
-   * Execute actual BLE print operation for a receipt
+   * Execute BLE printing of receipt (supports ESC/POS and Cat Printer)
    */
   public async printReceipt(receipt: Receipt): Promise<boolean> {
     try {
@@ -805,32 +843,29 @@ class BLEPrinterController {
       }
 
       this.updateState({ 
-        statusMessage: 'جاري رسم وتنسيق بيانات الفاتورة ذكياً...', 
+        statusMessage: 'جاري رسم وتنسيق بيانات الفاتورة حرارياً...', 
         progress: 25 
       });
       
-      // 1. Generate the receipt image canvas in memory
       const canvas = this.renderReceiptToEscPosDevice(receipt);
       
       if (this.state.printerType === 'cat_printer') {
-        // --- PRINT VIA CAT PRINTER PROTOCOL ---
+        // --- CAT PRINTER PROTOCOL ---
         this.updateState({ 
           statusMessage: 'جاري بدء الاتصال والتحضير لطابعة Cat...', 
           progress: 35 
         });
         
-        // 1. Initialize commands
         await this.sendBuffer(makeCatPrinterPacket(0x1a, 0x00, new Uint8Array([])));
         await this.sendBuffer(makeCatPrinterPacket(0x10, 0x00, new Uint8Array([])));
-        await this.sendBuffer(makeCatPrinterPacket(0xaf, 0x03, new Uint8Array([]))); // High energy (dark contrast)
+        await this.sendBuffer(makeCatPrinterPacket(0xaf, 0x03, new Uint8Array([]))); 
 
-        // 2. Loop over every row of the canvas
         const totalRows = canvas.height;
         for (let y = 0; y < totalRows; y++) {
           if (y % 10 === 0) {
             const rowProgress = 35 + Math.floor((y / totalRows) * 45);
             this.updateState({
-              statusMessage: `جاري نقل أسطر الفاتورة (${y} / ${totalRows})...`,
+              statusMessage: `جاري تغذية حزم الأسطر الرسومية (${y} / ${totalRows})...`,
               progress: rowProgress
             });
           }
@@ -844,9 +879,8 @@ class BLEPrinterController {
           progress: 85 
         });
 
-        // 3. Feed blank lines to push the paper out of the printer past the tear bar
         const feedLines = 100;
-        const blankRow = new Uint8Array(48); // 384 pixels / 8 bits = 48 bytes of 0x00 (white)
+        const blankRow = new Uint8Array(48); 
         for (let i = 0; i < feedLines; i++) {
           const rowPacket = makeCatPrinterPacket(0xa2, 0x00, blankRow);
           await this.sendBuffer(rowPacket);
@@ -855,7 +889,6 @@ class BLEPrinterController {
           }
         }
 
-        // 4. Power off timer configuration or clean finish
         await this.sendBuffer(makeCatPrinterPacket(0x1a, 0x00, new Uint8Array([])));
 
       } else {
@@ -865,11 +898,10 @@ class BLEPrinterController {
           progress: 35 
         });
         
-        // 2. Stream initialization command
         await this.sendBuffer(this.getInitCommands());
         await new Promise(resolve => setTimeout(resolve, 50));
 
-        // 3. Stream in horizontal stripe segments of 40 pixels
+        // Let's divide into high performance stripes
         const sliceHeight = 40;
         const totalHeight = canvas.height;
         const totalSlices = Math.ceil(totalHeight / sliceHeight);
@@ -879,15 +911,16 @@ class BLEPrinterController {
           sliceIdx++;
           const sliceProgress = 35 + Math.floor((sliceIdx / totalSlices) * 45);
           this.updateState({
-            statusMessage: `جاري طباعة الجزء (${sliceIdx} من ${totalSlices}) للطابعة الحرارية...`,
+            statusMessage: `جاري بث حزم البكسلات (${sliceIdx} / ${totalSlices}) للطابعة...`,
             progress: sliceProgress
           });
           
           const renderHeight = Math.min(sliceHeight, totalHeight - startY);
           const stripePayload = this.convertCanvasRectToEscPosRaster(canvas, startY, renderHeight);
           await this.sendBuffer(stripePayload);
-          // Slightly longer rest between stripe transfers to allow physical paper to feed
-          await new Promise(resolve => setTimeout(resolve, 80));
+          
+          // Little breather after standard stripe
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
 
         this.updateState({ 
@@ -895,7 +928,6 @@ class BLEPrinterController {
           progress: 90 
         });
 
-        // 4. Feed and cut
         const endCommand = this.getFeedAndCutCommands(isMobileApp() ? 6 : 5);
         await this.sendBuffer(endCommand);
       }
@@ -912,7 +944,7 @@ class BLEPrinterController {
       return true;
     } catch (err: any) {
       console.error('BLE Printing failure:', err);
-      this.handleDisconnection(); // Force clean reset of connection handles
+      this.handleDisconnection(); 
       this.updateState({ 
         error: err.message || 'فشلت عملية نقل البيانات إلى الطابعة. يرجى التحقق من اقتران البلوتوث.',
         statusMessage: null,
@@ -923,7 +955,136 @@ class BLEPrinterController {
   }
 
   /**
-   * Print a beautiful diagnostic test page to confirm connectivity
+   * Triggers the beautiful native Web Browser Print Dialog
+   * Highly optimized to serve as the ultimate standard Web App printing fallback
+   */
+  public printViaBrowser(receipt: Receipt): boolean {
+    const is80 = this.state.paperWidth === '80mm';
+    const paperWidthPx = is80 ? '300px' : '220px';
+    const receiptTitle = localStorage.getItem('receipt_title') || 'نظام مولدتي للخدمات الأهلية';
+    const receiptFirm = localStorage.getItem('receipt_firm') || 'شركة الحلول المتميزة المحدودة';
+    const receiptPhone = localStorage.getItem('receipt_phone') || '07701234567';
+    const receiptFooter = localStorage.getItem('receipt_footer') || 'شكراً لالتزامكم بالتسديد الشهري.';
+
+    let iframe = document.getElementById('ble-print-frame') as HTMLIFrameElement | null;
+    if (!iframe) {
+      iframe = document.createElement('iframe');
+      iframe.id = 'ble-print-frame';
+      iframe.style.position = 'fixed';
+      iframe.style.right = '0';
+      iframe.style.bottom = '0';
+      iframe.style.width = '0';
+      iframe.style.height = '0';
+      iframe.style.border = '0';
+      document.body.appendChild(iframe);
+    }
+
+    const doc = iframe.contentDocument || iframe.contentWindow?.document;
+    if (!doc) return false;
+
+    doc.open();
+    doc.write(`
+      <html>
+        <head>
+          <title>وصل تسديد - ${receiptTitle}</title>
+          <style>
+            @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700&display=swap');
+            @media print {
+              body {
+                margin: 0;
+                padding: 0;
+                background: #fff;
+              }
+              .ticket {
+                border: none !important;
+                box-shadow: none !important;
+                width: 100% !important;
+                max-width: 100% !important;
+                margin: 0 !important;
+                padding: 5px !important;
+              }
+            }
+            body {
+              font-family: 'Cairo', sans-serif;
+              direction: rtl;
+              text-align: center;
+              color: #000;
+              margin: 0;
+              padding: 10px;
+              background: #fff;
+              -webkit-print-color-adjust: exact;
+            }
+            .ticket {
+              max-width: ${paperWidthPx};
+              margin: 0 auto;
+              border: 1px dashed #555;
+              padding: 12px;
+              box-sizing: border-box;
+            }
+            .header { font-size: 15px; font-weight: 700; margin-bottom: 2px; color: #000; }
+            .sub-header { font-size: 10.5px; color: #444; margin-bottom: 4px; }
+            .divider { border-top: 1px dashed #444; margin: 8px 0; }
+            .row { display: flex; justify-content: space-between; font-size: 11.5px; margin: 4px 0; }
+            .row.bold { font-weight: 700; font-size: 12.5px; color: #000; }
+            .amount-box {
+              background: #fcfcfc;
+              padding: 6px;
+              border-radius: 4px;
+              margin: 8px 0;
+              font-weight: 700;
+              font-size: 13.5px;
+              border: 1px dashed #333;
+              color: #000;
+              text-align: center;
+            }
+            .footer { font-size: 10px; color: #333; margin-top: 12px; font-weight: 700; }
+            .barcode { font-family: monospace; font-size: 11px; margin-top: 8px; border: 1px solid #000; padding: 4px; display: inline-block; letter-spacing: 2px; }
+            .watermark { font-size: 8px; margin-top: 6px; color: #555; }
+          </style>
+        </head>
+        <body>
+          <div class="ticket">
+            <div class="header">${receiptTitle}</div>
+            <div class="sub-header">${receiptFirm}</div>
+            ${receiptPhone ? `<div class="sub-header">الهاتف: ${receiptPhone}</div>` : ''}
+            <div class="divider"></div>
+            <div class="row bold"><span>وصل استلام مالي</span> <span style="color:#059669;">مُسدّد بـالكامل 👍</span></div>
+            <div class="row"><span>رقم الوصل:</span> <span style="font-weight:700;">${receipt.invoiceNo}</span></div>
+            <div class="row"><span>تاريخ ووقت السداد:</span> <span>${receipt.paymentDate}</span></div>
+            <div class="divider"></div>
+            <div class="row bold"><span>المشترك:</span> <span>${receipt.subscriberName}</span></div>
+            <div class="row"><span>الهاتف:</span> <span>${receipt.subscriberPhone}</span></div>
+            <div class="row"><span>نوع الاشتراك:</span> <span>${receipt.subscriptionType}</span></div>
+            <div class="row"><span>الأمبيرات:</span> <span>${receipt.amps} أمبير</span></div>
+            <div class="row"><span>سعر الأمبير المنظّم:</span> <span>${receipt.pricePerAmp.toLocaleString()} د.ع</span></div>
+            <div class="row"><span>بوابة الدفع:</span> <span>${receipt.paymentMethod}</span></div>
+            <div class="row"><span>الجابي المستلم:</span> <span>${receipt.accountantName}</span></div>
+            <div class="divider"></div>
+            <div class="amount-box">
+              المبلغ المقبوض: ${receipt.totalAmount.toLocaleString()} د.ع
+            </div>
+            <div class="divider"></div>
+            <p class="footer">${receiptFooter}</p>
+            <div class="barcode">*${receipt.invoiceNo}*</div>
+            <div class="watermark">نظام إدارة المولدات - شركة الحلول المتميزة EX</div>
+          </div>
+          <script>
+            window.onload = function() {
+              setTimeout(function() {
+                window.focus();
+                window.print();
+              }, 250);
+            }
+          </script>
+        </body>
+      </html>
+    `);
+    doc.close();
+    return true;
+  }
+
+  /**
+   * Print a beautifully structured graphic test invoice
    */
   public async printTestPage(): Promise<boolean> {
     try {
@@ -947,7 +1108,7 @@ class BLEPrinterController {
       const canvas = document.createElement('canvas');
       const is85_or_80 = this.state.paperWidth === '80mm';
       const width = is85_or_80 ? 576 : 384;
-      const height = is85_or_80 ? 400 : 350;
+      const height = is85_or_80 ? 380 : 320;
       
       canvas.width = width;
       canvas.height = height;
@@ -963,43 +1124,46 @@ class BLEPrinterController {
 
       let currentY = 20;
 
-      // Centered Checkmark Badge
       ctx.font = 'bold 24px Arial';
       ctx.textAlign = 'center';
       ctx.fillText('✅', width / 2, currentY);
       currentY += 35;
 
-      ctx.font = 'bold 15px "Segoe UI", "Cairo", Arial, sans-serif';
-      ctx.fillText('اختبار اتصال الطابعة الحرارية', width / 2, currentY);
+      ctx.font = 'bold 15px "Cairo", "Segoe UI", Arial, sans-serif';
+      ctx.fillText('اختبار اتصال الطابعة الحرارية الميدانية', width / 2, currentY);
       currentY += 25;
 
       ctx.font = '10px monospace';
-      ctx.fillText(`الطابعة الحالية: ${this.state.deviceName}`, width / 2, currentY);
+      ctx.fillText(`الطابعة النشطة الحالية: ${this.state.deviceName}`, width / 2, currentY);
       currentY += 15;
 
       ctx.font = '10px monospace';
-      ctx.fillText(`نوع المنظومة: ${this.state.printerType === 'cat_printer' ? 'Cat Printer' : 'ESC/POS'}`, width / 2, currentY);
+      ctx.fillText(`بروتوكول البث: ${this.state.printerType === 'cat_printer' ? 'Cat Printer' : 'ESC/POS'}`, width / 2, currentY);
       currentY += 15;
 
       ctx.font = '10px monospace';
-      ctx.fillText(`عرض الورقة المعتمد: ${this.state.paperWidth}`, width / 2, currentY);
+      ctx.fillText(`مقاس حزمة النقل: ${this.state.chunkSize} Bytes`, width / 2, currentY);
       currentY += 15;
 
-      ctx.font = '10.5px "Segoe UI", "Cairo", Arial, sans-serif';
-      ctx.fillText(`تاريخ الاختبار: ${new Date().toLocaleString('ar-IQ')}`, width / 2, currentY);
+      ctx.font = '10px monospace';
+      ctx.fillText(`زمن تأخير المعالجة: ${this.state.chunkDelay} ms`, width / 2, currentY);
+      currentY += 15;
+
+      ctx.font = '10px monospace';
+      ctx.fillText(`تقنية التدرج (Dithering): ${this.state.ditheringEnabled ? 'مفعلة' : 'معطلة'}`, width / 2, currentY);
+      currentY += 15;
+
+      ctx.font = '11px "Cairo", "Segoe UI", Arial, sans-serif';
+      ctx.fillText(`التاريخ: ${new Date().toLocaleString('ar-IQ')}`, width / 2, currentY);
       currentY += 25;
 
       this.drawDashedLine(ctx, 20, width - 20, currentY);
       currentY += 15;
 
-      ctx.font = 'bold 11px "Segoe UI", "Cairo", Arial, sans-serif';
-      ctx.fillText('جاهز للطباعة الميدانية السريعة فورا!', width / 2, currentY);
-      currentY += 16;
-      ctx.font = '9px "Segoe UI", "Cairo", Arial, sans-serif';
-      ctx.fillText('نظام إدارة المولدات الذكي PWA - شركة الحلول المتميزة المحدودة', width / 2, currentY);
-      currentY += 25;
+      ctx.font = 'bold 11.5px "Cairo", "Segoe UI", Arial, sans-serif';
+      ctx.fillText('النظام الحراري جاهز لطباعة الوصولات بنجاح ⚡', width / 2, currentY);
+      currentY += 18;
 
-      // Draw Grid / Grayscale checker
       const size = 15;
       const startX = width / 2 - (size * 8) / 2;
       for (let i = 0; i < 8; i++) {
@@ -1008,7 +1172,6 @@ class BLEPrinterController {
       }
       
       if (this.state.printerType === 'cat_printer') {
-        // --- PRINT VIA CAT PRINTER PROTOCOL ---
         this.updateState({ 
           statusMessage: 'جاري بدء الاتصال والتحضير لطابعة Cat...', 
           progress: 35 
@@ -1017,7 +1180,7 @@ class BLEPrinterController {
         await this.sendBuffer(makeCatPrinterPacket(0x1a, 0x00, new Uint8Array([])));
         await this.sendBuffer(makeCatPrinterPacket(0x10, 0x00, new Uint8Array([])));
         await this.sendBuffer(makeCatPrinterPacket(0xaf, 0x03, new Uint8Array([])));
- 
+
         const totalRows = canvas.height;
         for (let y = 0; y < totalRows; y++) {
           if (y % 10 === 0) {
@@ -1038,7 +1201,7 @@ class BLEPrinterController {
         });
 
         const feedLines = 80;
-        const blankRow = new Uint8Array(48); // All zeros (white)
+        const blankRow = new Uint8Array(48); 
         for (let i = 0; i < feedLines; i++) {
           const rowPacket = makeCatPrinterPacket(0xa2, 0x00, blankRow);
           await this.sendBuffer(rowPacket);
@@ -1050,17 +1213,14 @@ class BLEPrinterController {
         await this.sendBuffer(makeCatPrinterPacket(0x1a, 0x00, new Uint8Array([])));
  
       } else {
-        // --- STANDARD ESC/POS FLOW ---
         this.updateState({ 
           statusMessage: 'جاري تهيئة قناة الطباعة (ESC/POS)...', 
           progress: 35 
         });
 
-        // Initialize printer
         await this.sendBuffer(this.getInitCommands());
         await new Promise(resolve => setTimeout(resolve, 50));
  
-        // Print in slices of 40px to prevent buffer overflow
         const sliceHeight = 40;
         const totalHeight = canvas.height;
         const totalSlices = Math.ceil(totalHeight / sliceHeight);
@@ -1085,7 +1245,6 @@ class BLEPrinterController {
           progress: 90 
         });
 
-        // Feed and cut
         const endCommand = this.getFeedAndCutCommands(4);
         await this.sendBuffer(endCommand);
       }
@@ -1102,7 +1261,7 @@ class BLEPrinterController {
       return true;
     } catch (err: any) {
       console.error('Test print failed:', err);
-      this.handleDisconnection(); // Force clean reset of connection handles
+      this.handleDisconnection(); 
       this.updateState({ 
         error: err.message || 'فشلت طباعة صفحة الاختبار.',
         statusMessage: null,
@@ -1113,18 +1272,16 @@ class BLEPrinterController {
   }
 
   /**
-   * Internal Service Scorer to avoid binding to standard metadata services like GAP/GATT
+   * SCORE SERVICE
    */
   private getServiceScore(uuid: string): number {
     const clean = uuid.toLowerCase();
     
-    // Check custom service
     const customService = this.getCustomServiceUuid();
     if (customService && clean === customService.toLowerCase()) {
-      return 10000; // Sky-high prioritization
+      return 10000; 
     }
 
-    // Known printer services
     const printerServices = [
       'ffe0', 'fff0', 'ffd0', 'ff00', 'fee7', 'ae30', 'af30', 'e000', '34b0',
       '6e400001', '49535343', 'e7fe1800', '38eb4a84', '243a2f0e'
@@ -1135,31 +1292,24 @@ class BLEPrinterController {
       }
     }
 
-    // Standard low-priority SIG metadata services
     const metadataServices = [
-      '1800', // GAP Generic Access (Highly commonly exposes false write properties)
-      '1801', // GATT Generic Attribute
-      '180a', // DIS Device Information
-      '180f', // BAS Battery Service
-      '180d', // Heart Rate
-      '1812', // HID Human Interface Device
+      '1800', '1801', '180a', '180f', '180d', '1812'
     ];
     for (const prefix of metadataServices) {
       if (clean.includes(prefix)) {
-        return -500; // Penalize standard services severely
+        return -500; 
       }
     }
 
-    return 5; // Neutral default for unrecognized vendor-specific UUIDs
+    return 5; 
   }
 
   /**
-   * Internal Characteristic Scorer to identify genuine print buffers
+   * SCORE CHARACTERISTIC
    */
   private getCharacteristicScore(charUuid: string, props: any): number {
     const clean = charUuid.toLowerCase();
 
-    // The characteristic MUST allow some form of write
     const canWrite = props.write || props.writeWithoutResponse || props.authenticatedSignedWrites;
     if (!canWrite) {
       return 0;
@@ -1167,17 +1317,15 @@ class BLEPrinterController {
 
     let score = 10;
 
-    // Check custom characteristic
     const customChar = this.getCustomCharacteristicUuid();
     if (customChar && clean === customChar.toLowerCase()) {
-      return 10000; // Sky-high prioritization
+      return 10000; 
     }
 
-    // High priority known write characteristics
     const printerWriteChars = [
       'ffe1', 'fff1', 'fff2', 'ffd1', 'ffd2', 'ff02', 'ae01', 'af01',
-      '6e400002', // Nordic UART Serial write (frequently used in premium BLE models)
-      '49535343-fe7d-4ae5-8fa9-9fafd205e455' // ISSC UART Transparent Write
+      '6e400002', 
+      '49535343-fe7d-4ae5-8fa9-9fafd205e455' 
     ];
 
     for (const target of printerWriteChars) {
@@ -1187,7 +1335,6 @@ class BLEPrinterController {
       }
     }
 
-    // Prefer writeWithoutResponse for raw high-speed unidirectional serial transfers
     if (props.writeWithoutResponse) {
       score += 50;
     }
@@ -1199,12 +1346,14 @@ class BLEPrinterController {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Could not get canvas 2D context');
 
-    const width = 384; // Cat Printer is strictly 384 pixels wide
+    const width = 384; 
     const imgData = ctx.getImageData(0, y, width, 1);
     const pixels = imgData.data;
 
-    const widthBytes = 48; // 384 / 8
+    const widthBytes = 48; 
     const rowBytes = new Uint8Array(widthBytes);
+
+    const threshold = this.state.contrastThreshold;
 
     for (let x = 0; x < width; x++) {
       const pixelIdx = x * 4;
@@ -1214,11 +1363,9 @@ class BLEPrinterController {
       const a = pixels[pixelIdx+3];
 
       let isBlack = false;
-      if (a < 50) {
-        isBlack = false;
-      } else {
+      if (a >= 50) {
         const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-        isBlack = luminance < 140; // grey threshold
+        isBlack = luminance < threshold; 
       }
 
       if (isBlack) {
@@ -1250,12 +1397,11 @@ function makeCatPrinterPacket(cmd: number, arg: number, payload: Uint8Array): Ui
   packet.set(lenBytes, offset); offset += lenBytes.length;
   packet.set(payload, offset); offset += payload.length;
   packet[offset] = checksum; offset += 1;
-  packet[offset] = 0xff; // footer
+  packet[offset] = 0xff; 
 
   return packet;
 }
 
-// Check context
 function isMobileApp(): boolean {
   return window.matchMedia('(display-mode: standalone)').matches || 
          (window.navigator as any).standalone === true;
